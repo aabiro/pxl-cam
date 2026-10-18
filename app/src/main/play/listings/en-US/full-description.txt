@@ -1,0 +1,8 @@
+Pxl Cam turns your Android phone into an ultra-low-latency 1080p 30fps studio webcam for macOS, OBS Studio, Zoom, Discord, Chrome, and FaceTime.
+
+KEY FEATURES:
+• Hardware ISP + H.264 Encoding: Streams directly from the Android Camera2 hardware ISP (preserving native 64-point sRGB + ADRC tone curves and hardware 3DNR) at 12 Mbps over USB or local network.
+• Real-Time Camera2 Hardware Controls: Adjust Lens (Back/Front), Flash Torch, Hardware Exposure Compensation (EV), Optical/Sensor Zoom, White Balance (AWB, Daylight, Cloudy, Tungsten, Fluorescent), and Autofocus (AF-C Video, AF-S Photo, Lock, Infinity) from your phone, macOS companion app, or OBS Custom Dock.
+• OLED Power Saver Mode: Dims the phone display to pure black during long broadcasts so your device runs cool for multi-hour streams.
+• 100% Local & Private: Zero cloud servers, zero accounts, zero analytics or tracking. Video frames stream strictly over your local USB/LAN connection.
+

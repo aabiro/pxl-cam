@@ -1,0 +1,24 @@
+# Gradle & Android
+.gradle/
+build/
+*/build/
+app/build/
+android/build/
+.kotlin/
+*.iml
+.idea/
+local.properties
+
+# macOS Binaries & System files
+.DS_Store
+mac/pxl-cam-mac
+mac/PxlCamApp
+
+# Signing & Secrets
+release-signing.env
+*.jks
+*.keystore
+
+# Python
+__pycache__/
+*.pyc

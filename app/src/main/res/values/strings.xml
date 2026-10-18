@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Pxl Cam</string>
+    <string name="notification_channel_name">Pxl Cam Studio Stream</string>
+    <string name="notification_channel_desc">Keeps low-latency 1080p hardware H.264 camera stream active for macOS &amp; OBS Studio.</string>
+    <string name="notification_title">Pxl Cam Studio Active</string>
+    <string name="notification_text">Streaming 1080p Hardware ISP H.264 on TCP :9876</string>
+    <string name="privacy_policy_title">Privacy &amp; Data Safety</string>
+    <string name="privacy_policy_body">Pxl Cam processes and streams camera video strictly locally over your USB (ADB) or local Wi-Fi connection to your own computer and OBS Studio.\n\n• Zero Cloud Uploads: Video frames never leave your local device or local network.\n• Zero Analytics or Ad Tracking: No personal data, biometrics, or usage telemetry is collected or shared with third parties.\n• Camera Permission: Used exclusively while the app or streaming service is active to capture hardware ISP video.</string>
+</resources>
+

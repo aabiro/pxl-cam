@@ -1,0 +1,2 @@
+Turn your Android phone into a 1080p 30fps hardware H.264 studio camera for OBS & macOS.
+

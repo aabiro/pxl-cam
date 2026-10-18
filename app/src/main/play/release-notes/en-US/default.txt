@@ -1,0 +1,5 @@
+• Initial Play Store release of Pxl Cam Studio (v1.0.0).
+• Full 1080p 30fps Camera2 + MediaCodec H.264 hardware encoder with native 64-point sRGB + ADRC tone curve preservation.
+• Real-time bidirectional control sync with macOS Pxl Cam and OBS Custom Dock.
+• Added OLED Power Saver mode and Foreground Service support for uninterrupted streaming.
+

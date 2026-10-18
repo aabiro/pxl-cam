@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="ic_launcher_background">#000000</color>
+    <color name="pxl_bg">#08090C</color>
+    <color name="pxl_card">#12141C</color>
+    <color name="pxl_orange">#FF8400</color>
+    <color name="pxl_orange_dim">#33FF8400</color>
+    <color name="pxl_green">#19E673</color>
+    <color name="pxl_text">#F4F5F8</color>
+    <color name="pxl_muted">#8E95A5</color>
+</resources>
+
