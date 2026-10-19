@@ -118,6 +118,9 @@ for size in 16 32 128 256 512; do
 done
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
 cp -f "$ICON_SRC" "$APP/Contents/Resources/AppIcon.png"
+if [ -f "$PXL_DIR/assets/pxl_cam_top_left_overlay.png" ]; then
+  cp -f "$PXL_DIR/assets/pxl_cam_top_left_overlay.png" "$APP/Contents/Resources/pxl_cam_top_left_overlay.png"
+fi
 
 # --- 4. Copy compiled native Mach-O executable directly into bundle ---
 # Putting the real Mach-O binary at Contents/MacOS/PxlCam ensures macOS
