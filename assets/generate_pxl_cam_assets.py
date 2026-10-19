@@ -125,6 +125,18 @@ def tag_opaque_png_srgb(png_path: Path) -> None:
     )
 
 
+def tag_rgba_png_srgb(png_path: Path) -> None:
+    from PIL import Image, ImageCms
+
+    srgb_profile = ImageCms.createProfile("sRGB")
+    im = Image.open(png_path).convert("RGBA")
+    im.save(
+        png_path,
+        format="PNG",
+        icc_profile=ImageCms.ImageCmsProfile(srgb_profile).tobytes(),
+    )
+
+
 def build_source_renders(source_png: Path, target_hex: str, tmp_dir: Path) -> Tuple[str, str]:
     from PIL import Image, ImageCms
     import numpy as np
@@ -186,6 +198,76 @@ def make_borders(border_color: str) -> Tuple[str, str]:
     return square_border, rounded_border
 
 
+def make_bttf_fox_svg(transparent: bool, border: Optional[str], scale: float) -> str:
+    """
+    Build a pure-vector 1024x1024 SVG of the BTTF Glam Fox icon (no wordmark)
+    from assets/pxl_cam_logo_bttf_glam.svg for dark (#000000) or light/transparent variants.
+    """
+    bttf_svg_path = ASSETS_DIR / "pxl_cam_logo_bttf_glam.svg"
+    lines = bttf_svg_path.read_text(encoding="utf-8").splitlines()
+    # Extract inner defs and artwork lines (between <defs>...</defs> and </svg>)
+    defs_block: List[str] = []
+    art_block: List[str] = []
+    in_defs = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("<?xml") or stripped.startswith("<svg") or stripped.startswith("</svg"):
+            continue
+        if stripped == "<defs>":
+            in_defs = True
+            continue
+        if stripped == "</defs>":
+            in_defs = False
+            continue
+        if in_defs:
+            defs_block.append(line)
+        else:
+            art_block.append(line)
+
+    # bttf_glam.svg viewBox is "-92.49 17.97 384.62 384.62" -> center (99.82, 210.28)
+    # Normalize base scale so scale=1.00 matches standard icon proportions (~860px tall)
+    # and scale=1.18 (noborder_scaled / scaled_transparent) fills ~980px without clipping.
+    eff_scale = (scale / SCALE_NB_SCALED) if scale >= SCALE_NB_SCALED else (scale * 0.88)
+    s = (SIZE / 384.62) * eff_scale
+    cx, cy = 99.82, 210.28
+    c = SIZE / 2.0
+    ft = f"translate({c:.2f},{c:.2f}) scale({s:.6f}) translate(-{cx:.2f},-{cy:.2f})"
+
+    out = [
+        '<?xml version="1.0" encoding="UTF-8" standalone="no"?>',
+        '<svg xmlns="http://www.w3.org/2000/svg"',
+        '     xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1"',
+        f'     width="{SIZE}" height="{SIZE}" viewBox="0 0 {SIZE} {SIZE}">',
+        '  <defs>',
+        *defs_block,
+        f'    <linearGradient id="bttf_border_grad" gradientUnits="userSpaceOnUse" x1="{c:.0f}" y1="{BORDER_INSET}" x2="{c:.0f}" y2="{SIZE - BORDER_INSET}">',
+        '      <stop offset="0.00" stop-color="#F04E27"/>',
+        '      <stop offset="0.14" stop-color="#F04E27"/>',
+        '      <stop offset="0.30" stop-color="#FF8400"/>',
+        '      <stop offset="0.44" stop-color="#FFC91B"/>',
+        '      <stop offset="0.50" stop-color="#FFF36B"/>',
+        '      <stop offset="0.56" stop-color="#FFC91B"/>',
+        '      <stop offset="0.72" stop-color="#FF8400"/>',
+        '      <stop offset="0.88" stop-color="#F04E27"/>',
+        '      <stop offset="1.00" stop-color="#F04E27"/>',
+        '    </linearGradient>',
+        '  </defs>',
+    ]
+
+    if not transparent:
+        out.append(f'  <rect width="{SIZE}" height="{SIZE}" fill="#000000"/>')
+
+    out.append(f'  <g transform="{ft}">')
+    out.extend(f"  {line}" for line in art_block)
+    out.append('  </g>')
+
+    if border:
+        out.append(border)
+
+    out.append('</svg>')
+    return '\n'.join(out)
+
+
 def make_svg(image_uri: str, transparent: bool, border: Optional[str], scale: float) -> str:
     c = SIZE / 2
     ft = f"translate({c},{c}) scale({scale}) translate(-{c},-{c})"
@@ -222,13 +304,18 @@ def generate_suite_for_candidate(
     info = CANDIDATES[cand_id]
     stem = info["stem"]
     color = info["color"]
-    source_path = CANDIDATES_DIR / info["source"]
-    if not source_path.exists():
-        raise SystemExit(f"Missing candidate source PNG: {source_path}")
+    is_bttf_fox = (cand_id == 4 and (ASSETS_DIR / "pxl_cam_logo_bttf_glam.svg").exists())
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    opaque_uri, transparent_uri = build_source_renders(source_path, color, tmp_dir)
-    square_border, rounded_border = make_borders(color)
+    if is_bttf_fox:
+        opaque_uri, transparent_uri = "", ""
+        square_border, rounded_border = make_borders("url(#bttf_border_grad)")
+    else:
+        source_path = CANDIDATES_DIR / info["source"]
+        if not source_path.exists():
+            raise SystemExit(f"Missing candidate source PNG: {source_path}")
+        opaque_uri, transparent_uri = build_source_renders(source_path, color, tmp_dir)
+        square_border, rounded_border = make_borders(color)
 
     variant_specs = [
         ("noborder",            False, None,           SCALE_NB),
@@ -248,12 +335,14 @@ def generate_suite_for_candidate(
         full_stem = f"{stem}_{suffix}"
         svg_path = out_dir / f"{full_stem}.svg"
         png_path = out_dir / f"{full_stem}.png"
-        image_uri = transparent_uri if is_transparent else opaque_uri
 
-        svg_path.write_text(
-            make_svg(image_uri, is_transparent, border_svg, scale),
-            encoding="utf-8",
-        )
+        if is_bttf_fox:
+            svg_content = make_bttf_fox_svg(is_transparent, border_svg, scale)
+        else:
+            image_uri = transparent_uri if is_transparent else opaque_uri
+            svg_content = make_svg(image_uri, is_transparent, border_svg, scale)
+
+        svg_path.write_text(svg_content, encoding="utf-8")
 
         cmd = ["rsvg-convert", "-w", str(SIZE), "-h", str(SIZE)]
         if is_transparent:
@@ -261,10 +350,16 @@ def generate_suite_for_candidate(
         cmd += [str(svg_path), "-o", str(png_path)]
         run(cmd)
 
-        if is_transparent:
-            lock_transparent_png_color(png_path, color)
+        if is_bttf_fox:
+            if is_transparent:
+                tag_rgba_png_srgb(png_path)
+            else:
+                tag_opaque_png_srgb(png_path)
         else:
-            tag_opaque_png_srgb(png_path)
+            if is_transparent:
+                lock_transparent_png_color(png_path, color)
+            else:
+                tag_opaque_png_srgb(png_path)
 
         # Also place directly in Scripts/pxl_cam/assets/ and shadowscraper/assets/logos/
         shutil.copy2(svg_path, ASSETS_DIR / svg_path.name)
@@ -275,6 +370,9 @@ def generate_suite_for_candidate(
 
         generated[f"{suffix}.svg"] = svg_path
         generated[f"{suffix}.png"] = png_path
+
+    if is_bttf_fox and "noborder.png" in generated:
+        shutil.copy2(generated["noborder.png"], CANDIDATES_DIR / info["source"])
 
     return generated
 
