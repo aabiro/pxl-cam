@@ -1,12 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SERIAL="${1:-ZY22H9HQNL}"
-DEFAULT_LENS="${2:-0}"
-DEFAULT_WIDTH="${3:-1920}"
-DEFAULT_HEIGHT="${4:-1080}"
+export PATH="/opt/homebrew/bin:/usr/local/bin:${PATH:-}"
 
 PXL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ $# -ge 1 ]]; then
+    SERIAL="$1"
+    DEFAULT_LENS="${2:-0}"
+    DEFAULT_WIDTH="${3:-1920}"
+    DEFAULT_HEIGHT="${4:-1080}"
+else
+    SERIAL="$("$PXL_DIR/resolve_android_device.sh")"
+    DEFAULT_LENS=0
+    DEFAULT_WIDTH=1920
+    DEFAULT_HEIGHT=1080
+fi
 SERVER_JAR="$PXL_DIR/android/pxl-cam-server.jar"
 SCRCPY_SERVER="/opt/homebrew/Cellar/scrcpy/4.1/share/scrcpy/scrcpy-server"
 if [ -x "/Applications/Pxl Cam.app/Contents/MacOS/PxlCam" ]; then

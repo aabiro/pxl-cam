@@ -401,11 +401,44 @@ public final class PxlCamServer {
         }
     }
 
+    private static boolean isExternalCameraClientRunning() {
+        java.io.File procDir = new java.io.File("/proc");
+        String[] entries = procDir.list();
+        if (entries == null) return false;
+        int myPid = android.os.Process.myPid();
+        for (String name : entries) {
+            if (name.isEmpty() || !Character.isDigit(name.charAt(0))) continue;
+            try {
+                int pid = Integer.parseInt(name);
+                if (pid == myPid) continue;
+                java.io.File cmdFile = new java.io.File(procDir, name + "/cmdline");
+                try (java.io.FileInputStream fis = new java.io.FileInputStream(cmdFile)) {
+                    byte[] buf = new byte[512];
+                    int n = fis.read(buf);
+                    if (n > 0) {
+                        String cmd = new String(buf, 0, n, java.nio.charset.StandardCharsets.UTF_8);
+                        if (cmd.contains("com.genymobile.scrcpy.Server") && cmd.contains("video_source=camera")) {
+                            return true;
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {}
+        }
+        return false;
+    }
+
     private static void startWatchdogThread() {
         Thread watchdog = new Thread(() -> {
             while (true) {
                 try {
                     Thread.sleep(500);
+                    if (isExternalCameraClientRunning()) {
+                        if (currentDevice != null) {
+                            closeCameraResources();
+                        }
+                        lastFrameTimeMs.set(SystemClock.elapsedRealtime());
+                        continue;
+                    }
                     long elapsed = SystemClock.elapsedRealtime() - lastFrameTimeMs.get();
                     if (elapsed > 2500 && !reconfiguring.get()) {
                         System.err.println("[PxlCam] Watchdog detected ISP stall (" + elapsed + "ms) — auto-healing Camera2 session...");
@@ -424,6 +457,10 @@ public final class PxlCamServer {
         Thread reconfigThread = new Thread(() -> {
             try {
                 closeCameraResources();
+                Thread.sleep(450);
+                while (isExternalCameraClientRunning()) {
+                    Thread.sleep(600);
+                }
                 openAndConfigureCamera();
             } catch (Throwable t) {
                 t.printStackTrace(System.err);

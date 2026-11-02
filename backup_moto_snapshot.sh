@@ -1,7 +1,14 @@
 #!/bin/zsh
 set -euo pipefail
 
-SERIAL="${1:-ZY22H9HQNL}"
+export PATH="/opt/homebrew/bin:/usr/local/bin:${PATH:-}"
+
+PXL_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [[ -n "${1:-}" ]]; then
+    SERIAL="$1"
+else
+    SERIAL="$("$PXL_DIR/resolve_android_device.sh")"
+fi
 BACKUP_ROOT="/Users/aaryn/Projects/pxl-cam/backups/moto_g_pure_snapshot"
 mkdir -p "$BACKUP_ROOT/sdcard" "$BACKUP_ROOT/apks" "$BACKUP_ROOT/settings"
 
@@ -25,7 +32,12 @@ RESTORE_SCRIPT="$BACKUP_ROOT/restore_all_apks.sh"
 cat << 'EOF' > "$RESTORE_SCRIPT"
 #!/bin/zsh
 set -e
-SERIAL="${1:-ZY22H9HQNL}"
+export PATH="/opt/homebrew/bin:/usr/local/bin:${PATH:-}"
+if [[ -n "${1:-}" ]]; then
+    SERIAL="$1"
+else
+    SERIAL="$(/Users/aaryn/Projects/pxl-cam/resolve_android_device.sh)"
+fi
 SCRIPT_DIR="${0:A:h}"
 for pkg_dir in "$SCRIPT_DIR/apks"/*(/); do
     pkg_name="${pkg_dir:t}"

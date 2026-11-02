@@ -30,11 +30,13 @@ struct ISPUniforms {
     int flipVertical;
     int rotationQuadrants; // 0, 1 (90 CW), 2 (180), 3 (270 CW)
     float brightnessGain;
+    float flashDimFactor;
     float shadowLift;
     float contrastBoost;
     float saturationBoost;
     float sharpenStrength;
     float denoiseStrength;
+    float warmthShift;
 };
 
 vertex VertexOut vertexPassthrough(uint vertexID [[vertex_id]],
@@ -174,11 +176,14 @@ fragment float4 studioISPFragment(VertexOut in [[stage_in]],
     float shadowNeutralW = smoothstep(0.005, 0.040, preToneY);
     preToneChroma *= (0.50 + 0.50 * shadowNeutralW);
 
+    float dimW = clamp(u.flashDimFactor, 0.05, 1.0);
+    float effShadowLift = u.shadowLift * dimW * dimW;
+
     float liftedY = preToneY;
-    if (u.shadowLift > 0.001) {
-        float gamma = 1.0 / (1.0 + u.shadowLift * 1.15);
+    if (effShadowLift > 0.001) {
+        float gamma = 1.0 / (1.0 + effShadowLift * 1.15);
         float powerY = pow(clamp(liftedY, 0.0, 1.0), gamma);
-        float maxRatio = 1.0 + u.shadowLift * 3.8;
+        float maxRatio = 1.0 + effShadowLift * 3.8;
         liftedY = min(powerY, liftedY * maxRatio);
     }
 
@@ -236,6 +241,16 @@ fragment float4 studioISPFragment(VertexOut in [[stage_in]],
         graded = mix(postSpatial, prevSample, temporalAlpha);
     }
 
+    if (abs(u.warmthShift) > 0.001) {
+        graded.r = clamp(graded.r + u.warmthShift * 0.14, 0.0, 1.0);
+        graded.g = clamp(graded.g + u.warmthShift * 0.02, 0.0, 1.0);
+        graded.b = clamp(graded.b - u.warmthShift * 0.16, 0.0, 1.0);
+    }
+
+    if (dimW < 0.999) {
+        graded = clamp(graded * dimW, 0.0, 1.0);
+    }
+
     return float4(graded, 1.0);
 }
 """
@@ -247,11 +262,13 @@ struct ISPUniforms {
     var flipVertical: Int32
     var rotationQuadrants: Int32
     var brightnessGain: Float
+    var flashDimFactor: Float
     var shadowLift: Float
     var contrastBoost: Float
     var saturationBoost: Float
     var sharpenStrength: Float
     var denoiseStrength: Float
+    var warmthShift: Float
 }
 
 // MARK: - Pxl Cam Scene Analysis Metrics
@@ -331,6 +348,7 @@ final class MetalVideoView: MTKView, MTKViewDelegate {
     var saturationBoost: Float = 1.04
     var sharpenStrength: Float = 0.52
     var denoiseStrength: Float = 0.38
+    var warmthShift: Float = 0.0
 
     var frameWidth: Int = 1920
     var frameHeight: Int = 1080
@@ -526,12 +544,14 @@ final class MetalVideoView: MTKView, MTKViewDelegate {
             mirrorHorizontal: mirrorHorizontal ? 1 : 0,
             flipVertical: flipVertical ? 1 : 0,
             rotationQuadrants: Int32(rotQ),
-            brightnessGain: brightnessGain * flashDimFactor,
+            brightnessGain: brightnessGain,
+            flashDimFactor: flashDimFactor,
             shadowLift: shadowLift,
             contrastBoost: contrastBoost,
             saturationBoost: saturationBoost,
             sharpenStrength: sharpenStrength,
-            denoiseStrength: denoiseStrength
+            denoiseStrength: denoiseStrength,
+            warmthShift: warmthShift
         )
         encoder.setRenderPipelineState(pipelineState)
         encoder.setVertexBytes(&uniforms, length: MemoryLayout<ISPUniforms>.stride, index: 0)
@@ -1249,11 +1269,13 @@ final class MetalVideoView: MTKView, MTKViewDelegate {
                     flipVertical: 0,
                     rotationQuadrants: 0,
                     brightnessGain: 1.0,
+                    flashDimFactor: 1.0,
                     shadowLift: 0.0,
                     contrastBoost: 1.0,
                     saturationBoost: 1.0,
                     sharpenStrength: 0.0,
-                    denoiseStrength: 0.0
+                    denoiseStrength: 0.0,
+                    warmthShift: 0.0
                 )
                 encoder.setRenderPipelineState(passthroughPipelineState)
                 encoder.setVertexBytes(&passthroughUniforms, length: MemoryLayout<ISPUniforms>.stride, index: 0)
@@ -1295,12 +1317,14 @@ final class MetalVideoView: MTKView, MTKViewDelegate {
                     mirrorHorizontal: mirrorHorizontal ? 1 : 0,
                     flipVertical: flipVertical ? 1 : 0,
                     rotationQuadrants: Int32(rotationQuadrants % 4),
-                    brightnessGain: brightnessGain * flashDimFactor,
+                    brightnessGain: brightnessGain,
+                    flashDimFactor: flashDimFactor,
                     shadowLift: shadowLift,
                     contrastBoost: contrastBoost,
                     saturationBoost: saturationBoost,
                     sharpenStrength: sharpenStrength,
-                    denoiseStrength: denoiseStrength
+                    denoiseStrength: denoiseStrength,
+                    warmthShift: warmthShift
                 )
                 encoder.setRenderPipelineState(pipelineState)
                 encoder.setVertexBytes(&uniforms, length: MemoryLayout<ISPUniforms>.stride, index: 0)
@@ -1325,11 +1349,13 @@ final class OverlayPillWindow: NSPanel {
 }
 
 // MARK: - Main Application Controller
-final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class PxlCamAppDelegate: NSResponder, NSApplicationDelegate, NSWindowDelegate {
     private var videoWindow: NSWindow!
     private var overlayPillWindow: OverlayPillWindow!
     private var topLeftBrandWindow: OverlayPillWindow!
     private var settingsWindow: NSPanel!
+    private var hoverTooltipWindow: NSPanel!
+    private var hoverTooltipLabel: NSTextField!
     private var videoView: MetalVideoView!
 
     // Minimal Overlay Pill Controls
@@ -1337,6 +1363,8 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
     private var pillStatusLabel: NSTextField!
     private var pillFlipBtn: NSButton!
     private var pillFlashBtn: NSButton!
+    private var pillZoomSlider: NSSlider!
+    private var pillZoomLabel: NSTextField!
     private var pillAFBtn: NSButton!
     private var pillSnapBtn: NSButton!
     private var pillRecordBtn: NSButton!
@@ -1352,12 +1380,12 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
     private var flashSegment: NSSegmentedControl!
     private var flashDimmerSlider: NSSlider!
     private var flashDimmerLabel: NSTextField!
+    private var topZoomSlider: NSSlider!
+    private var topZoomLabel: NSTextField!
     private var wbPopup: NSPopUpButton!
     private var afModePopup: NSPopUpButton!
     private var aeLockCheck: NSButton!
     private var awbLockCheck: NSButton!
-    private var zoomSlider: NSSlider!
-    private var zoomLabel: NSTextField!
     private var evSlider: NSSlider!
     private var evLabel: NSTextField!
     private var qualitySlider: NSSlider!
@@ -1395,6 +1423,11 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
     private var currentFPSMode: Int = 0    // 0 = Low-Light Auto (default), 1 = 30fps Lock, 2 = Night Boost
     private var currentZoom: Float = 1.0
     private var currentEV: Int = 0
+    private var currentPreset: Int = 1     // 0=Natural, 1=Studio, 2=Broadcast, 3=Cinema, 4=Clean, 5=Warm, 6=Crisp
+    private var isWandModeActive: Bool = false
+    private var isAFActive: Bool = false
+    private var snapActiveUntil: CFAbsoluteTime = 0.0
+    private weak var hoveredPillButton: NSView?
     private var hudVisible: Bool = true
     private var controlsHideTimer: Timer?
     private var controlsEventMonitor: Any?
@@ -1410,7 +1443,7 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
 
     // Networking & Telemetry
     private let commandQueue = DispatchQueue(label: "com.pxlcam.app.cmd")
-    private var outputStream: OutputStream?
+    private var activeClientSocket: Int32 = -1
     private var isConnected: Bool = false
     private var lastAutoServerLaunchAttempt: CFAbsoluteTime = 0.0
     private var frameCounter: Int = 0
@@ -1419,6 +1452,7 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
     private var lastFrameBytes: Int = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        UserDefaults.standard.register(defaults: ["NSInitialToolTipDelay": 90])
         NSApp.setActivationPolicy(.regular)
         NSApp.appearance = NSAppearance(named: .darkAqua)
         // Prevent macOS App Nap so Metal 1080p ISP & OBS streaming run at full 30fps even when minimized in the Dock!
@@ -1427,6 +1461,7 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
             reason: "Pxl Cam Live 1080p Studio Stream & OBS Custom Dock"
         )
         applyCustomApplicationIcon()
+        buildHoverTooltipWindow()
         buildVideoWindow()
         buildTopLeftBrandOverlay()
         buildMinimalOverlayPill()
@@ -1543,7 +1578,7 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
 
     // MARK: - 2. Sleek Translucent Floating Overlay Pill (With ✨ Magic Wand & ⚙️ Settings Gear)
     private func buildMinimalOverlayPill() {
-        let pillWidth: CGFloat = 548
+        let pillWidth: CGFloat = 668
         let pillHeight: CGFloat = 42
         let contentRect = videoWindow.contentRect(forFrameRect: videoWindow.frame)
         let pillRect = NSRect(
@@ -1565,6 +1600,8 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         overlayPillWindow.level = .floating
         overlayPillWindow.sharingType = .readOnly
         overlayPillWindow.acceptsMouseMovedEvents = true
+        overlayPillWindow.contentMinSize = NSSize(width: pillWidth, height: pillHeight)
+        overlayPillWindow.contentMaxSize = NSSize(width: pillWidth, height: pillHeight)
 
         let glassView = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: pillWidth, height: pillHeight))
         glassView.autoresizingMask = [.width, .height]
@@ -1580,59 +1617,97 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         glassView.layer?.borderColor = NSColor.white.withAlphaComponent(0.16).cgColor
 
         let stack = NSStackView(frame: glassView.bounds.insetBy(dx: 14, dy: 6))
-        stack.autoresizingMask = [.width, .height]
+        stack.translatesAutoresizingMaskIntoConstraints = false
         stack.orientation = .horizontal
         stack.alignment = .centerY
         stack.distribution = .fill
-        stack.spacing = 8
+        stack.spacing = 7
 
         pillStatusDot = NSTextField(labelWithString: "●")
         pillStatusDot.font = NSFont.systemFont(ofSize: 12, weight: .bold)
         pillStatusDot.textColor = NSColor.systemGreen
+        pillStatusDot.setContentHuggingPriority(.required, for: .horizontal)
+        pillStatusDot.setContentCompressionResistancePriority(.required, for: .horizontal)
+        attachHoverTooltip(pillStatusDot, "🟢 Live Connection Status Indicator")
         stack.addArrangedSubview(pillStatusDot)
 
         pillStatusLabel = NSTextField(labelWithString: "1920×1080 • 30 fps")
         pillStatusLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .semibold)
         pillStatusLabel.textColor = NSColor.white.withAlphaComponent(0.92)
         pillStatusLabel.lineBreakMode = .byTruncatingTail
-        pillStatusLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        pillStatusLabel.maximumNumberOfLines = 1
+        pillStatusLabel.usesSingleLineMode = true
+        pillStatusLabel.cell?.wraps = false
+        pillStatusLabel.cell?.isScrollable = false
+        pillStatusLabel.cell?.truncatesLastVisibleLine = true
+        pillStatusLabel.setContentHuggingPriority(NSLayoutConstraint.Priority(1), for: .horizontal)
+        pillStatusLabel.setContentCompressionResistancePriority(NSLayoutConstraint.Priority(1), for: .horizontal)
+        attachHoverTooltip(pillStatusLabel, "📡 Active Stream Resolution, FPS & Bitrate Telemetry")
         stack.addArrangedSubview(pillStatusLabel)
 
-        pillFlipBtn = makePillIconButton(symbol: "camera.rotate.fill", tooltip: "Flip Camera Lens (Back / Front) [F]", action: #selector(onQuickFlipLens))
+        pillFlipBtn = makePillIconButton(symbol: "camera.rotate.fill", tooltip: "🔄 Flip Camera Lens (Back Wide ↔ Front Selfie) [F]", action: #selector(onQuickFlipLens))
         stack.addArrangedSubview(pillFlipBtn)
 
-        pillFlashBtn = makePillIconButton(symbol: "bolt.slash.fill", tooltip: "Cycle Flash: Off / On (Torch) / Auto [T]", action: #selector(onQuickCycleFlash))
+        pillFlashBtn = makePillIconButton(symbol: "bolt.slash.fill", tooltip: "⚡ Cycle Flash Mode: Off → Torch On → Auto Flash [T]", action: #selector(onQuickCycleFlash))
         stack.addArrangedSubview(pillFlashBtn)
 
-        pillAFBtn = makePillIconButton(symbol: "scope", tooltip: "Trigger Autofocus Now [A]", action: #selector(onTriggerAF))
+        // Compact Zoom Level Slider right on the Floating HUD Pill
+        pillZoomSlider = NSSlider(value: 1.0, minValue: 1.0, maxValue: 6.0, target: self, action: #selector(onPillZoomSliderChanged))
+        pillZoomSlider.isContinuous = true
+        pillZoomSlider.controlSize = .small
+        attachHoverTooltip(pillZoomSlider, "🔍 Hardware Sensor Zoom Level (1.0× – 6.0×) [+ / -]")
+        pillZoomSlider.translatesAutoresizingMaskIntoConstraints = false
+        pillZoomSlider.widthAnchor.constraint(equalToConstant: 72).isActive = true
+        pillZoomSlider.setContentHuggingPriority(.required, for: .horizontal)
+        pillZoomSlider.setContentCompressionResistancePriority(.required, for: .horizontal)
+        stack.addArrangedSubview(pillZoomSlider)
+
+        pillZoomLabel = NSTextField(labelWithString: "1.0×")
+        pillZoomLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .bold)
+        pillZoomLabel.textColor = NSColor.systemOrange
+        pillZoomLabel.alignment = .right
+        attachHoverTooltip(pillZoomLabel, "🔍 Current Hardware Zoom Ratio [+ / -]")
+        pillZoomLabel.translatesAutoresizingMaskIntoConstraints = false
+        pillZoomLabel.widthAnchor.constraint(equalToConstant: 30).isActive = true
+        pillZoomLabel.setContentHuggingPriority(.required, for: .horizontal)
+        pillZoomLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        stack.addArrangedSubview(pillZoomLabel)
+
+        pillAFBtn = makePillIconButton(symbol: "scope", tooltip: "🎯 Toggle / Trigger Hardware Autofocus Lock & Sweep [A]", action: #selector(onTriggerAF))
         stack.addArrangedSubview(pillAFBtn)
 
-        pillSnapBtn = makePillIconButton(symbol: "camera.aperture", tooltip: "Save Full-Res Snapshot (.jpg) to ~/Downloads [P]", action: #selector(onTakeSnapshot))
+        pillSnapBtn = makePillIconButton(symbol: "camera.aperture", tooltip: "📸 Save Full-Res JPEG Snapshot to ~/Downloads [P]", action: #selector(onTakeSnapshot))
         stack.addArrangedSubview(pillSnapBtn)
 
-        pillRecordBtn = makePillIconButton(symbol: "record.circle", tooltip: "Start / Stop Video Recording (.mp4) to ~/Downloads [V]", action: #selector(onToggleRecording))
+        pillRecordBtn = makePillIconButton(symbol: "record.circle", tooltip: "🔴 Start / Stop H.264 MP4 Video Recording to ~/Downloads [V]", action: #selector(onToggleRecording))
         pillRecordBtn.contentTintColor = NSColor.systemRed
         stack.addArrangedSubview(pillRecordBtn)
 
         // Magic Wand Button (Pxl Cam Dual-Track Auto-Fix!)
-        pillWandBtn = makePillIconButton(symbol: "wand.and.stars", tooltip: "✨ Magic Wand: Auto-Fix Lighting, Exposure, WB & Studio ISP (Pxl Cam AI) [W]", action: #selector(onMagicWandAutoTune))
+        pillWandBtn = makePillIconButton(symbol: "wand.and.stars", tooltip: "✨ AI Magic Wand: Toggle Auto-Tune Exposure, WB & Metal Studio ISP [W]", action: #selector(onPillWandButtonClicked))
         pillWandBtn.contentTintColor = NSColor.systemYellow
-        pillWandBtn.layer?.backgroundColor = NSColor.systemYellow.withAlphaComponent(0.18).cgColor
         stack.addArrangedSubview(pillWandBtn)
 
         // Settings Gear Button (Opens off-screen Settings Inspector!)
-        pillGearBtn = makePillIconButton(symbol: "gearshape.fill", tooltip: "Open Pxl Cam Studio Settings [,]", action: #selector(onToggleSettingsWindow))
+        pillGearBtn = makePillIconButton(symbol: "gearshape.fill", tooltip: "⚙️ Open / Close Pxl Cam Studio Controls [ , ]", action: #selector(onToggleSettingsWindow))
         pillGearBtn.contentTintColor = NSColor.systemCyan
         stack.addArrangedSubview(pillGearBtn)
 
         glassView.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: glassView.leadingAnchor, constant: 14),
+            stack.trailingAnchor.constraint(equalTo: glassView.trailingAnchor, constant: -14),
+            stack.topAnchor.constraint(equalTo: glassView.topAnchor, constant: 6),
+            stack.bottomAnchor.constraint(equalTo: glassView.bottomAnchor, constant: -6)
+        ])
         overlayPillWindow.contentView = glassView
         videoWindow.addChildWindow(overlayPillWindow, ordered: .above)
         repositionOverlayPill()
+        updateDockButtonStates()
     }
 
     private func makePillIconButton(symbol: String, tooltip: String, action: Selector) -> NSButton {
-        let btn = NSButton(frame: NSRect(x: 0, y: 0, width: 30, height: 28))
+        let btn = NSButton(frame: NSRect(x: 0, y: 0, width: 32, height: 28))
         btn.bezelStyle = .texturedRounded
         btn.isBordered = false
         btn.wantsLayer = true
@@ -1645,24 +1720,237 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
             btn.title = "⚙️"
         }
         btn.contentTintColor = .white
-        btn.toolTip = tooltip
         btn.target = self
         btn.action = action
         btn.translatesAutoresizingMaskIntoConstraints = false
+        btn.setContentHuggingPriority(.required, for: .horizontal)
+        btn.setContentCompressionResistancePriority(.required, for: .horizontal)
         NSLayoutConstraint.activate([
             btn.widthAnchor.constraint(equalToConstant: 32),
             btn.heightAnchor.constraint(equalToConstant: 28)
         ])
+        attachHoverTooltip(btn, tooltip, isPillIcon: true)
         return btn
+    }
+
+    /// Styles a dock pill icon button with a persistent glowing outline and active fill when ON,
+    /// plus responsive hover feedback without stripping the active outline on mouse exit.
+    private func stylePillButton(_ btn: NSButton?, isActive: Bool, activeColor: NSColor, inactiveTint: NSColor = .white) {
+        guard let btn = btn else { return }
+        let isHovered = (hoveredPillButton === btn)
+        btn.wantsLayer = true
+        btn.layer?.cornerRadius = 14
+        if isActive {
+            btn.layer?.borderWidth = isHovered ? 2.2 : 1.8
+            btn.layer?.borderColor = (isHovered ? NSColor.white : activeColor).withAlphaComponent(0.98).cgColor
+            if activeColor == .systemRed {
+                btn.layer?.backgroundColor = NSColor.systemRed.withAlphaComponent(isHovered ? 0.92 : 0.82).cgColor
+                btn.contentTintColor = .white
+            } else {
+                btn.layer?.backgroundColor = activeColor.withAlphaComponent(isHovered ? 0.38 : 0.28).cgColor
+                btn.contentTintColor = activeColor
+            }
+        } else if isHovered {
+            btn.layer?.borderWidth = 1.4
+            btn.layer?.borderColor = NSColor.systemOrange.withAlphaComponent(0.92).cgColor
+            btn.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.16).cgColor
+            btn.contentTintColor = inactiveTint
+        } else {
+            btn.layer?.borderWidth = 0.0
+            btn.layer?.borderColor = NSColor.clear.cgColor
+            btn.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.09).cgColor
+            btn.contentTintColor = inactiveTint
+        }
+    }
+
+    /// Synchronizes the ON / OFF visual state and persistent active outline of all 7 dock buttons.
+    private func updateDockButtonStates() {
+        let now = CFAbsoluteTimeGetCurrent()
+        // 1. Flip Lens Button: ON when Front Camera (1) is active
+        stylePillButton(
+            pillFlipBtn,
+            isActive: currentLens == 1,
+            activeColor: .systemOrange,
+            inactiveTint: .white
+        )
+
+        // 2. Flash / Torch Button: ON when Torch (1) or Auto Flash (2) is active
+        let flashColor: NSColor = (currentFlashMode == 2) ? .systemCyan : .systemYellow
+        stylePillButton(
+            pillFlashBtn,
+            isActive: currentFlashMode != 0,
+            activeColor: flashColor,
+            inactiveTint: .white
+        )
+
+        // 3. Autofocus Button: ON when AF Lock / Sweep is active or non-default AF mode is active
+        stylePillButton(
+            pillAFBtn,
+            isActive: isAFActive || currentAFMode != 0,
+            activeColor: .systemGreen,
+            inactiveTint: .white
+        )
+
+        // 4. Snapshot Button: Illuminates active cyan outline when a snapshot is captured
+        stylePillButton(
+            pillSnapBtn,
+            isActive: now < snapActiveUntil,
+            activeColor: .systemCyan,
+            inactiveTint: .white
+        )
+
+        // 5. Record MP4 Button: ON with persistent red/white outline while recording
+        let isRec = (videoView?.isRecording == true)
+        stylePillButton(
+            pillRecordBtn,
+            isActive: isRec,
+            activeColor: .systemRed,
+            inactiveTint: .systemRed
+        )
+
+        // 6. AI Magic Wand Button: ON with persistent golden-yellow outline while AI Wand mode is active
+        stylePillButton(
+            pillWandBtn,
+            isActive: isWandModeActive,
+            activeColor: .systemYellow,
+            inactiveTint: NSColor.systemYellow.withAlphaComponent(0.88)
+        )
+        if let aiWandHeroBtn = aiWandHeroBtn {
+            aiWandHeroBtn.wantsLayer = true
+            aiWandHeroBtn.layer?.cornerRadius = 6
+            aiWandHeroBtn.layer?.borderWidth = isWandModeActive ? 1.5 : 0.0
+            aiWandHeroBtn.layer?.borderColor = isWandModeActive ? NSColor.systemYellow.cgColor : NSColor.clear.cgColor
+        }
+
+        // 7. Settings Gear Button: ON with persistent cyan outline while Studio Controls window is open
+        let isSettingsOpen = (settingsWindow?.isVisible == true)
+        stylePillButton(
+            pillGearBtn,
+            isActive: isSettingsOpen,
+            activeColor: .systemCyan,
+            inactiveTint: NSColor.systemCyan.withAlphaComponent(0.88)
+        )
+    }
+
+    // MARK: - 2A. Instant Studio Hover Tooltip System (Works on Non-Activating HUD & Settings Panels)
+    private func buildHoverTooltipWindow() {
+        hoverTooltipWindow = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 220, height: 28),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        hoverTooltipWindow.isOpaque = false
+        hoverTooltipWindow.backgroundColor = .clear
+        hoverTooltipWindow.hasShadow = true
+        hoverTooltipWindow.level = .statusBar
+        hoverTooltipWindow.ignoresMouseEvents = true
+        hoverTooltipWindow.sharingType = .readOnly
+
+        let bubble = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 28))
+        bubble.autoresizingMask = [.width, .height]
+        bubble.wantsLayer = true
+        bubble.layer?.cornerRadius = 7.0
+        bubble.layer?.masksToBounds = true
+        bubble.layer?.backgroundColor = NSColor(calibratedRed: 0.05, green: 0.06, blue: 0.09, alpha: 0.96).cgColor
+        bubble.layer?.borderWidth = 1.0
+        bubble.layer?.borderColor = NSColor.systemOrange.withAlphaComponent(0.85).cgColor
+
+        hoverTooltipLabel = NSTextField(labelWithString: "")
+        hoverTooltipLabel.font = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
+        hoverTooltipLabel.textColor = NSColor(calibratedWhite: 0.97, alpha: 1.0)
+        hoverTooltipLabel.alignment = .center
+        hoverTooltipLabel.frame = NSRect(x: 10, y: 5, width: 200, height: 18)
+        bubble.addSubview(hoverTooltipLabel)
+
+        hoverTooltipWindow.contentView = bubble
+        hoverTooltipWindow.orderOut(nil)
+    }
+
+    private func attachHoverTooltip(_ view: NSView, _ text: String, isPillIcon: Bool = false) {
+        view.toolTip = text
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseEnteredAndExited, .inVisibleRect, .activeAlways],
+            owner: self,
+            userInfo: [
+                "tip": text,
+                "view": view,
+                "pill": isPillIcon
+            ]
+        )
+        view.addTrackingArea(area)
+    }
+
+    private func showHoverTooltipBubble(text: String, for view: NSView) {
+        guard let win = view.window, win.isVisible, win.alphaValue > 0.1 else { return }
+        hoverTooltipLabel.stringValue = text
+        hoverTooltipLabel.sizeToFit()
+        let textSize = hoverTooltipLabel.frame.size
+        let padX: CGFloat = 12
+        let padY: CGFloat = 5
+        let bubbleW = ceil(textSize.width + padX * 2)
+        let bubbleH = ceil(max(26, textSize.height + padY * 2))
+
+        hoverTooltipLabel.frame = NSRect(
+            x: padX,
+            y: round((bubbleH - textSize.height) / 2.0),
+            width: ceil(textSize.width),
+            height: ceil(textSize.height)
+        )
+
+        let viewRectInWindow = view.convert(view.bounds, to: nil)
+        let viewRectOnScreen = win.convertToScreen(viewRectInWindow)
+
+        var tipX = round(viewRectOnScreen.midX - bubbleW / 2.0)
+        var tipY = round(viewRectOnScreen.maxY + 7.0)
+
+        if let screenFrame = (win.screen ?? NSScreen.main)?.visibleFrame {
+            tipX = max(screenFrame.minX + 8, min(tipX, screenFrame.maxX - bubbleW - 8))
+            if tipY + bubbleH > screenFrame.maxY - 6 {
+                tipY = round(viewRectOnScreen.minY - bubbleH - 7.0)
+            }
+        }
+
+        hoverTooltipWindow.setFrame(NSRect(x: tipX, y: tipY, width: bubbleW, height: bubbleH), display: true)
+        hoverTooltipWindow.orderFrontRegardless()
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        guard let info = event.trackingArea?.userInfo,
+              let tip = info["tip"] as? String,
+              let view = info["view"] as? NSView else {
+            return
+        }
+        showControlsAndResetTimer()
+        if let isPill = info["pill"] as? Bool, isPill {
+            hoveredPillButton = view
+            updateDockButtonStates()
+        }
+        showHoverTooltipBubble(text: tip, for: view)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        if let info = event.trackingArea?.userInfo,
+           let view = info["view"] as? NSView,
+           let isPill = info["pill"] as? Bool, isPill {
+            if hoveredPillButton === view {
+                hoveredPillButton = nil
+            }
+            updateDockButtonStates()
+        }
+        hoverTooltipWindow?.orderOut(nil)
     }
 
     private func repositionOverlayPill() {
         guard let videoWindow = videoWindow, let overlayPillWindow = overlayPillWindow else { return }
         let contentRect = videoWindow.contentRect(forFrameRect: videoWindow.frame)
-        let pillWidth: CGFloat = min(548, max(410, contentRect.width - 20))
+        let pillWidth: CGFloat = min(668, max(480, contentRect.width - 20))
         let pillHeight: CGFloat = 42
-        let pillX = contentRect.origin.x + (contentRect.width - pillWidth) / 2.0
-        let pillY = contentRect.origin.y + 16
+        let pillX = round(contentRect.origin.x + (contentRect.width - pillWidth) / 2.0)
+        let pillY = round(contentRect.origin.y + 16)
+        overlayPillWindow.contentMinSize = NSSize(width: pillWidth, height: pillHeight)
+        overlayPillWindow.contentMaxSize = NSSize(width: pillWidth, height: pillHeight)
         overlayPillWindow.setFrame(NSRect(x: pillX, y: pillY, width: pillWidth, height: pillHeight), display: true)
 
         if let topLeftBrandWindow = topLeftBrandWindow {
@@ -1730,11 +2018,19 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         repositionOverlayPill()
     }
 
+    func windowWillClose(_ notification: Notification) {
+        if let closingWin = notification.object as? NSWindow, closingWin === settingsWindow {
+            DispatchQueue.main.async { [weak self] in
+                self?.updateDockButtonStates()
+            }
+        }
+    }
+
     // MARK: - 3. Separate Off-Screen Settings Window (Opened via ⚙️ Gear)
     private func buildSettingsInspectorWindow() {
         let videoFrame = videoWindow.frame
         let inspectorWidth: CGFloat = 396
-        let inspectorHeight: CGFloat = 748
+        let inspectorHeight: CGFloat = 746
         let inspectorX = min(videoFrame.maxX + 14, (NSScreen.main?.visibleFrame.maxX ?? 1600) - inspectorWidth - 10)
         let inspectorY = max(videoFrame.minY, 60)
 
@@ -1749,6 +2045,8 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         settingsWindow.isFloatingPanel = true
         settingsWindow.becomesKeyOnlyIfNeeded = false
         settingsWindow.sharingType = .readOnly
+        settingsWindow.acceptsMouseMovedEvents = true
+        settingsWindow.delegate = self
 
         let bgView = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: inspectorWidth, height: inspectorHeight))
         bgView.autoresizingMask = [.width, .height]
@@ -1772,13 +2070,13 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         aiWandHeroBtn.bezelStyle = .rounded
         aiWandHeroBtn.contentTintColor = .systemYellow
         aiWandHeroBtn.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
-        aiWandHeroBtn.toolTip = "Analyze live scene and auto-tune exposure, white balance & Metal Studio ISP [W]"
+        attachHoverTooltip(aiWandHeroBtn, "✨ Analyze live scene and auto-tune exposure, white balance & Metal Studio ISP [W]")
 
         let topResetDefaultsBtn = NSButton(title: "↺ Reset Defaults [D]", target: self, action: #selector(onResetAllDefaults))
         topResetDefaultsBtn.bezelStyle = .rounded
         topResetDefaultsBtn.contentTintColor = .systemCyan
         topResetDefaultsBtn.font = NSFont.systemFont(ofSize: 12, weight: .medium)
-        topResetDefaultsBtn.toolTip = "Reset all Camera2 hardware, Flash, WB, Zoom, EV, Orientation & Metal Studio ISP settings to factory defaults [D]"
+        attachHoverTooltip(topResetDefaultsBtn, "↺ Reset all Camera2 hardware, Flash, WB, Zoom, EV, Orientation & Metal Studio ISP settings to defaults [D]")
 
         wandHeaderRow.addArrangedSubview(aiWandHeroBtn)
         wandHeaderRow.addArrangedSubview(topResetDefaultsBtn)
@@ -1790,6 +2088,7 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         aiTelemetryLabel.lineBreakMode = .byTruncatingTail
         aiTelemetryLabel.translatesAutoresizingMaskIntoConstraints = false
         aiTelemetryLabel.widthAnchor.constraint(equalToConstant: 356).isActive = true
+        attachHoverTooltip(aiTelemetryLabel, "📊 Real-time Dual-Track AI Scene Telemetry (Sharpness, Noise, Saturation & Face Detection)")
         mainStack.addArrangedSubview(aiTelemetryLabel)
 
         mainStack.addArrangedSubview(makeDivider())
@@ -1798,7 +2097,7 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         mainStack.addArrangedSubview(makeSectionHeader("CAMERA & RESOLUTION"))
 
         lensPopup = makePopup(["Back Camera (0 — Wide)", "Front Camera (1 — Selfie)"], selected: 0, action: #selector(onLensPopupChanged))
-        mainStack.addArrangedSubview(makeFormRow("Camera Lens:", control: lensPopup))
+        mainStack.addArrangedSubview(makeFormRow("Camera Lens:", control: lensPopup, tooltip: "📷 Switch between Back Wide Camera (0) and Front Selfie Camera (1) [F]"))
 
         resPopup = makePopup([
             "4K UHD (3840×2160)",
@@ -1806,14 +2105,14 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
             "1080p Full HD (1920×1080 — Default)",
             "720p HD Fast (1280×720)"
         ], selected: 2, action: #selector(onResPopupChanged))
-        mainStack.addArrangedSubview(makeFormRow("Resolution:", control: resPopup))
+        mainStack.addArrangedSubview(makeFormRow("Resolution:", control: resPopup, tooltip: "📐 Select Hardware Capture Resolution (4K, QHD+, 1080p Default, or 720p) [1 / 2 / 3]"))
 
         fpsModePopup = makePopup([
             "Low-Light Auto (15–30 fps • Bright)",
             "Studio Locked (30 fps • Fast Shutter)",
             "Max Night Boost (5–30 fps • Max Light)"
         ], selected: 0, action: #selector(onFPSModeChanged))
-        mainStack.addArrangedSubview(makeFormRow("Shutter / Light:", control: fpsModePopup))
+        mainStack.addArrangedSubview(makeFormRow("Shutter / Light:", control: fpsModePopup, tooltip: "⏱ Select Shutter & Low-Light Integration Mode (Auto 15–30fps, Locked 30fps, or Max Night Boost)"))
 
         mainStack.addArrangedSubview(makeDivider())
 
@@ -1822,11 +2121,15 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
 
         flashSegment = NSSegmentedControl(labels: ["Off", "On (Torch)", "Auto Flash"], trackingMode: .selectOne, target: self, action: #selector(onFlashSegmentChanged))
         flashSegment.selectedSegment = 0
-        mainStack.addArrangedSubview(makeFormRow("Flash Mode:", control: flashSegment))
+        mainStack.addArrangedSubview(makeFormRow("Flash Mode:", control: flashSegment, tooltip: "⚡ Select Rear LED Flash Mode: Off, Continuous Torch, or Auto Flash [T]"))
 
-        let (fdRow, fdSlider, fdVal) = makeSliderRow(title: "Flash Dimmer:", min: 0.0, max: 100.0, val: 0.0, fmt: "OFF", action: #selector(onFlashDimmerSliderChanged))
+        let (fdRow, fdSlider, fdVal) = makeSliderRow(title: "Flash Dimmer:", min: 0.0, max: 100.0, val: 0.0, fmt: "OFF", action: #selector(onFlashDimmerSliderChanged), tooltip: "💡 Torch / Flash Dimmer (0% = OFF, 1%–100% = Smooth Optical + AE Torch Dimming)")
         flashDimmerSlider = fdSlider; flashDimmerLabel = fdVal
         mainStack.addArrangedSubview(fdRow)
+
+        let (tzRow, tzSlider, tzVal) = makeSliderRow(title: "Zoom Level:", min: 1.0, max: 6.0, val: 1.0, fmt: "1.0×", action: #selector(onTopZoomSliderChanged), tooltip: "🔍 Hardware Sensor Crop & Zoom Level (1.0× – 6.0×) [+ / -]")
+        topZoomSlider = tzSlider; topZoomLabel = tzVal
+        mainStack.addArrangedSubview(tzRow)
 
         wbPopup = makePopup([
             "Auto White Balance",
@@ -1836,22 +2139,25 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
             "Fluorescent (4000K)",
             "Shade / Twilight"
         ], selected: 0, action: #selector(onWBChanged))
-        mainStack.addArrangedSubview(makeFormRow("White Balance:", control: wbPopup))
+        mainStack.addArrangedSubview(makeFormRow("White Balance:", control: wbPopup, tooltip: "🌡 Select Camera2 White Balance Preset (Auto, Daylight, Cloudy, Warm, Fluorescent, Shade)"))
 
         afModePopup = makePopup([
             "Continuous Video AF",
             "Macro Close-Up AF",
             "Locked Focus (Manual)"
         ], selected: 0, action: #selector(onAFModeChanged))
-        mainStack.addArrangedSubview(makeFormRow("Focus Mode:", control: afModePopup))
+        mainStack.addArrangedSubview(makeFormRow("Focus Mode:", control: afModePopup, tooltip: "🎯 Select Autofocus Mode (Continuous Video AF, Macro Close-Up, or Locked Manual Focus)"))
 
         let locksRow = NSStackView()
         locksRow.orientation = .horizontal
         locksRow.spacing = 14
         aeLockCheck = NSButton(checkboxWithTitle: "Lock Exposure (AE)", target: self, action: #selector(onAELockChanged))
+        attachHoverTooltip(aeLockCheck, "🔒 Lock Hardware Auto-Exposure (AE) at current brightness")
         awbLockCheck = NSButton(checkboxWithTitle: "Lock WB (AWB)", target: self, action: #selector(onAWBLockChanged))
+        attachHoverTooltip(awbLockCheck, "🔒 Lock Hardware Auto White Balance (AWB) at current color temperature")
         let refocusBtn = NSButton(title: "🎯 Refocus", target: self, action: #selector(onTriggerAF))
         refocusBtn.bezelStyle = .rounded
+        attachHoverTooltip(refocusBtn, "🎯 Trigger a fresh hardware autofocus sweep right now [A]")
         locksRow.addArrangedSubview(aeLockCheck)
         locksRow.addArrangedSubview(awbLockCheck)
         locksRow.addArrangedSubview(refocusBtn)
@@ -1862,15 +2168,11 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         // --- SECTION 3: HARDWARE SENSOR OPTICS ---
         mainStack.addArrangedSubview(makeSectionHeader("HARDWARE SENSOR OPTICS"))
 
-        let (zRow, zSlider, zVal) = makeSliderRow(title: "Sensor Zoom:", min: 1.0, max: 6.0, val: 1.0, fmt: "1.0×", action: #selector(onZoomSliderChanged))
-        zoomSlider = zSlider; zoomLabel = zVal
-        mainStack.addArrangedSubview(zRow)
-
-        let (eRow, eSlider, eVal) = makeSliderRow(title: "Sensor EV:", min: -12.0, max: 12.0, val: 0.0, fmt: "+0 EV", action: #selector(onEVSliderChanged))
+        let (eRow, eSlider, eVal) = makeSliderRow(title: "Sensor EV:", min: -12.0, max: 12.0, val: 0.0, fmt: "+0 EV", action: #selector(onEVSliderChanged), tooltip: "☀️ Hardware Sensor Exposure Compensation (-12 EV to +12 EV) [[ / ]]")
         evSlider = eSlider; evLabel = eVal
         mainStack.addArrangedSubview(eRow)
 
-        let (qRow, qSlider, qVal) = makeSliderRow(title: "ISP Quality:", min: 60.0, max: 98.0, val: 92.0, fmt: "92%", action: #selector(onQualitySliderChanged))
+        let (qRow, qSlider, qVal) = makeSliderRow(title: "ISP Quality:", min: 60.0, max: 98.0, val: 92.0, fmt: "92%", action: #selector(onQualitySliderChanged), tooltip: "🎞 Stream Encoding Quality (60% – 98%, Default 92%)")
         qualitySlider = qSlider; qualityLabel = qVal
         mainStack.addArrangedSubview(qRow)
 
@@ -1883,30 +2185,31 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         ispHeaderRow.addArrangedSubview(makeSectionHeader("METAL STUDIO ISP & BRIGHTNESS"))
         ispCheck = NSButton(checkboxWithTitle: "Denoise + Sharpen", target: self, action: #selector(onISPCheckChanged))
         ispCheck.state = .on
+        attachHoverTooltip(ispCheck, "✨ Enable/Disable Real-Time Metal GPU Bilateral Denoise & Luma Unsharp Mask")
         ispHeaderRow.addArrangedSubview(ispCheck)
         mainStack.addArrangedSubview(ispHeaderRow)
 
-        let (bRow, bSlider, bVal) = makeSliderRow(title: "Brightness:", min: 0.6, max: 3.2, val: 1.12, fmt: "1.12×", action: #selector(onGPUGradeChanged))
+        let (bRow, bSlider, bVal) = makeSliderRow(title: "Brightness:", min: 0.6, max: 3.2, val: 1.12, fmt: "1.12×", action: #selector(onGPUGradeChanged), tooltip: "☀️ Metal Studio ISP Brightness Gain (0.60× – 3.20×)")
         brightnessSlider = bSlider; brightnessLabel = bVal
         mainStack.addArrangedSubview(bRow)
 
-        let (sRow, sSlider, sVal) = makeSliderRow(title: "Shadow Lift:", min: 0.0, max: 0.90, val: 0.16, fmt: "+16%", action: #selector(onGPUGradeChanged))
+        let (sRow, sSlider, sVal) = makeSliderRow(title: "Shadow Lift:", min: 0.0, max: 0.90, val: 0.16, fmt: "+16%", action: #selector(onGPUGradeChanged), tooltip: "🌗 Metal Studio ISP Shadow Lift (Opens dark shadows without blowing highlights)")
         shadowSlider = sSlider; shadowLabel = sVal
         mainStack.addArrangedSubview(sRow)
 
-        let (cRow, cSlider, cVal) = makeSliderRow(title: "Contrast:", min: 0.7, max: 1.45, val: 1.05, fmt: "1.05×", action: #selector(onGPUGradeChanged))
+        let (cRow, cSlider, cVal) = makeSliderRow(title: "Contrast:", min: 0.7, max: 1.45, val: 1.05, fmt: "1.05×", action: #selector(onGPUGradeChanged), tooltip: "◑ Metal Studio ISP S-Curve Contrast Boost (0.70× – 1.45×)")
         contrastSlider = cSlider; contrastLabel = cVal
         mainStack.addArrangedSubview(cRow)
 
-        let (satRow, satSlider, satVal) = makeSliderRow(title: "Saturation:", min: 0.0, max: 1.8, val: 1.04, fmt: "1.04×", action: #selector(onGPUGradeChanged))
+        let (satRow, satSlider, satVal) = makeSliderRow(title: "Saturation:", min: 0.0, max: 1.8, val: 1.04, fmt: "1.04×", action: #selector(onGPUGradeChanged), tooltip: "🎨 Metal Studio ISP Color Saturation (0.00× Monochrome – 1.80× Vibrant)")
         saturationSlider = satSlider; saturationLabel = satVal
         mainStack.addArrangedSubview(satRow)
 
-        let (dnRow, dnSlider, dnVal) = makeSliderRow(title: "Denoise:", min: 0.0, max: 0.95, val: 0.38, fmt: "0.38", action: #selector(onGPUGradeChanged))
+        let (dnRow, dnSlider, dnVal) = makeSliderRow(title: "Denoise:", min: 0.0, max: 0.95, val: 0.38, fmt: "0.38", action: #selector(onGPUGradeChanged), tooltip: "🧹 Metal GPU Bilateral + Temporal 3DNR Chroma/Luma Denoise Strength")
         denoiseSlider = dnSlider; denoiseLabel = dnVal
         mainStack.addArrangedSubview(dnRow)
 
-        let (shpRow, shpSlider, shpVal) = makeSliderRow(title: "Sharpness:", min: 0.0, max: 1.2, val: 0.52, fmt: "0.52", action: #selector(onGPUGradeChanged))
+        let (shpRow, shpSlider, shpVal) = makeSliderRow(title: "Sharpness:", min: 0.0, max: 1.2, val: 0.52, fmt: "0.52", action: #selector(onGPUGradeChanged), tooltip: "🔪 Metal GPU Luma-Adaptive Unsharp Mask Detail Sharpness")
         sharpnessSlider = shpSlider; sharpnessLabel = shpVal
         mainStack.addArrangedSubview(shpRow)
 
@@ -1920,13 +2223,17 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         transformRow.spacing = 8
         autoRotateCheck = NSButton(checkboxWithTitle: "📱 Auto-Rotate", target: self, action: #selector(onTransformChanged))
         autoRotateCheck.state = .on
+        attachHoverTooltip(autoRotateCheck, "📱 Automatically rotate window between 16:9 Landscape & 9:16 Portrait with phone orientation")
         mirrorCheck = NSButton(checkboxWithTitle: "Mirror ⇄", target: self, action: #selector(onTransformChanged))
+        attachHoverTooltip(mirrorCheck, "⇄ Mirror video horizontally (Left ↔ Right) [M]")
         flipVCheck = NSButton(checkboxWithTitle: "Flip ⇅", target: self, action: #selector(onTransformChanged))
+        attachHoverTooltip(flipVCheck, "⇅ Flip video vertically (Top ↔ Bottom)")
         let rotBtn = NSButton(title: "↻ 90°", target: self, action: #selector(onRotate90))
         rotBtn.bezelStyle = .rounded
+        attachHoverTooltip(rotBtn, "↻ Rotate video 90° clockwise [R]")
         let resetBtn = NSButton(title: "↺ Reset Defaults", target: self, action: #selector(onResetAllDefaults))
         resetBtn.bezelStyle = .rounded
-        resetBtn.toolTip = "Reset all Camera2 & Studio ISP settings to defaults [D]"
+        attachHoverTooltip(resetBtn, "↺ Reset all Camera2 & Studio ISP settings to defaults [D]")
         transformRow.addArrangedSubview(autoRotateCheck)
         transformRow.addArrangedSubview(mirrorCheck)
         transformRow.addArrangedSubview(flipVCheck)
@@ -1939,11 +2246,14 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         bottomRow.spacing = 8
         screenOffCheck = NSButton(checkboxWithTitle: "🌙 Screen Off", target: self, action: #selector(onScreenOffChanged))
         screenOffCheck.state = .on
+        attachHoverTooltip(screenOffCheck, "🌙 Dim phone OLED screen to save battery & eliminate heat while streaming")
         let snapBtn = NSButton(title: "📸 Snapshot [P]", target: self, action: #selector(onTakeSnapshot))
         snapBtn.bezelStyle = .rounded
+        attachHoverTooltip(snapBtn, "📸 Save full-resolution JPEG snapshot to ~/Downloads [P]")
         recordBtn = NSButton(title: "⏺ Record MP4 [V]", target: self, action: #selector(onToggleRecording))
         recordBtn.bezelStyle = .rounded
         recordBtn.contentTintColor = .systemRed
+        attachHoverTooltip(recordBtn, "🔴 Start / Stop H.264 MP4 Video Recording to ~/Downloads [V]")
         bottomRow.addArrangedSubview(screenOffCheck)
         bottomRow.addArrangedSubview(snapBtn)
         bottomRow.addArrangedSubview(recordBtn)
@@ -1983,7 +2293,7 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         return popup
     }
 
-    private func makeFormRow(_ labelText: String, control: NSView) -> NSStackView {
+    private func makeFormRow(_ labelText: String, control: NSView, tooltip: String = "") -> NSStackView {
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
@@ -1993,12 +2303,16 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         lbl.textColor = .secondaryLabelColor
         lbl.translatesAutoresizingMaskIntoConstraints = false
         lbl.widthAnchor.constraint(equalToConstant: 105).isActive = true
+        if !tooltip.isEmpty {
+            attachHoverTooltip(lbl, tooltip)
+            attachHoverTooltip(control, tooltip)
+        }
         row.addArrangedSubview(lbl)
         row.addArrangedSubview(control)
         return row
     }
 
-    private func makeSliderRow(title: String, min: Double, max: Double, val: Double, fmt: String, action: Selector) -> (NSStackView, NSSlider, NSTextField) {
+    private func makeSliderRow(title: String, min: Double, max: Double, val: Double, fmt: String, action: Selector, tooltip: String = "") -> (NSStackView, NSSlider, NSTextField) {
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
@@ -2022,6 +2336,12 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         valLbl.translatesAutoresizingMaskIntoConstraints = false
         valLbl.widthAnchor.constraint(equalToConstant: 54).isActive = true
 
+        if !tooltip.isEmpty {
+            attachHoverTooltip(lbl, tooltip)
+            attachHoverTooltip(slider, tooltip)
+            attachHoverTooltip(valLbl, tooltip)
+        }
+
         row.addArrangedSubview(lbl)
         row.addArrangedSubview(slider)
         row.addArrangedSubview(valLbl)
@@ -2030,6 +2350,7 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
 
     // MARK: - Actions & Commands
     @objc private func onToggleSettingsWindow() {
+        hoverTooltipWindow?.orderOut(nil)
         if settingsWindow.isVisible {
             settingsWindow.orderOut(nil)
         } else {
@@ -2042,6 +2363,22 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
             settingsWindow.setFrameOrigin(NSPoint(x: x, y: max(60, vFrame.maxY - settingsWindow.frame.height)))
             settingsWindow.makeKeyAndOrderFront(nil)
         }
+        updateDockButtonStates()
+    }
+
+    @objc private func onPillWandButtonClicked() {
+        showControlsAndResetTimer()
+        if isWandModeActive {
+            isWandModeActive = false
+            onResetGrade()
+            wandBannerText = "✨ AI Wand Off • Studio ISP"
+            wandBannerUntil = CFAbsoluteTimeGetCurrent() + 2.2
+            pillStatusLabel.stringValue = wandBannerText
+            aiTelemetryLabel.stringValue = "✨ AI Magic Wand disabled — restored Studio Default ISP grade"
+            updateDockButtonStates()
+        } else {
+            onMagicWandAutoTune()
+        }
     }
 
     /// Pxl Cam Dual-Track Magic Wand Auto-Tuner:
@@ -2049,15 +2386,15 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
     /// Combines Track A (Calibrated Camera2 Hardware Sensor Rules) + Track B (Continuous Feature-to-ISP Mapping)
     /// across three closed-loop passes (Pass 1 immediate + Pass 2 at 0.85s + Pass 3 at 1.65s after sensor AE settling).
     @objc private func onMagicWandAutoTune() {
+        isWandModeActive = true
+        currentPreset = -1
+        updateDockButtonStates()
         guard let stats = videoView.analyzeCurrentFrame(detectFaces: true) else {
-            wandBannerText = "✨ Waiting for live video frame..."
+            wandBannerText = "✨ Waiting for live video..."
             wandBannerUntil = CFAbsoluteTimeGetCurrent() + 2.0
             pillStatusLabel.stringValue = wandBannerText
             return
         }
-
-        // Visual feedback on the Magic Wand button
-        pillWandBtn.layer?.backgroundColor = NSColor.systemYellow.withAlphaComponent(0.42).cgColor
 
         // Unlock AE & AWB first so hardware can respond
         if aeLockCheck.state == .on {
@@ -2127,7 +2464,7 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
 
         // --- PASS 2: Closed-Loop Fine-Tune after Android Sensor AE settles (0.85s later) ---
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.85) { [weak self] in
-            guard let self = self else { return }
+            guard let self = self, self.isWandModeActive else { return }
             guard let settledStats = self.videoView.analyzeCurrentFrame(detectFaces: false) else { return }
             let mergedStats = FrameSceneStats(
                 rawMeanLuma: settledStats.rawMeanLuma,
@@ -2153,8 +2490,8 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
 
         // --- PASS 3: Final Convergence Pass after long-shutter Night Boost fully stabilizes (1.65s later) ---
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.65) { [weak self] in
-            guard let self = self else { return }
-            self.pillWandBtn.layer?.backgroundColor = NSColor.systemYellow.withAlphaComponent(0.18).cgColor
+            guard let self = self, self.isWandModeActive else { return }
+            self.updateDockButtonStates()
             guard let finalStats = self.videoView.analyzeCurrentFrame(detectFaces: false) else { return }
             let mergedStats = FrameSceneStats(
                 rawMeanLuma: finalStats.rawMeanLuma,
@@ -2267,7 +2604,7 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         let lumaPct = Int((stats.rawMeanLuma * 100.0).rounded())
         let faceBadge = (stats.faceCount > 0) ? " • 👤\(stats.faceCount)" : ""
         let evStr = "\(currentEV >= 0 ? "+" : "")\(currentEV)EV"
-        let summary = String(
+        let fullSummary = String(
             format: "✨ %@ • Luma %d%% • %@ • Gain %.2f× • Lift +%d%%%@",
             profileTag,
             lumaPct,
@@ -2276,27 +2613,37 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
             Int((targetShadowLift * 100.0).rounded()),
             faceBadge
         )
-        wandBannerText = summary
+        let compactBanner = String(
+            format: "✨ %@ • %@ • %.2f×",
+            profileTag,
+            evStr,
+            targetBrightness
+        )
+        wandBannerText = compactBanner
         wandBannerUntil = CFAbsoluteTimeGetCurrent() + 3.6
-        pillStatusLabel.stringValue = summary
+        pillStatusLabel.stringValue = compactBanner
+        pillStatusLabel.toolTip = fullSummary
         aiTelemetryLabel.stringValue = String(
             format: "%@ | Sharp %.0f | Noise %.1f | Sat %.0f",
-            summary,
+            fullSummary,
             stats.laplacianSharpness,
             stats.gaussianNoiseStd,
             stats.hsvSaturation255
         )
+        updateDockButtonStates()
     }
 
     @objc private func onQuickFlipLens() {
         currentLens = (currentLens == 0) ? 1 : 0
         lensPopup.selectItem(at: currentLens)
         sendCommand("LENS:\(currentLens)")
+        updateDockButtonStates()
     }
 
     @objc private func onLensPopupChanged() {
         currentLens = lensPopup.indexOfSelectedItem
         sendCommand("LENS:\(currentLens)")
+        updateDockButtonStates()
     }
 
     @objc private func onResPopupChanged() {
@@ -2341,6 +2688,7 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
             updateFlashPillIconOnly()
             _ = videoView.renderStudioProcessedPixelBuffer(updateHistory: true)
             sendCommand("TORCH_STRENGTH:0")
+            sendCommand("EV:\(currentEV)")
         } else {
             currentFlashStrength = pct
             if currentLens == 0 && currentFlashMode == 0 {
@@ -2348,32 +2696,30 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
                 flashSegment?.selectedSegment = 1
             }
             flashDimmerLabel?.stringValue = "\(pct)%"
-            videoView.flashDimFactor = 0.62 + 0.38 * (Float(pct) / 100.0)
+            videoView.flashDimFactor = 0.10 + 0.90 * powf(Float(pct) / 100.0, 1.30)
             updateFlashPillIconOnly()
             _ = videoView.renderStudioProcessedPixelBuffer(updateHistory: true)
             sendCommand("TORCH_STRENGTH:\(pct)")
+            let dimEV = max(-12, currentEV - Int(round((1.0 - Float(pct) / 100.0) * 6.0)))
+            sendCommand("EV:\(dimEV)")
         }
     }
 
     private func updateFlashPillIconOnly() {
         let symbol: String
-        let tint: NSColor
         switch currentFlashMode {
         case 1:
             symbol = "bolt.fill"
-            tint = .systemYellow
         case 2:
             symbol = "bolt.badge.automatic.fill"
-            tint = .systemCyan
         default:
             symbol = "bolt.slash.fill"
-            tint = .white
         }
         if let img = NSImage(systemSymbolName: symbol, accessibilityDescription: "Flash") {
             let cfg = NSImage.SymbolConfiguration(pointSize: 13, weight: .semibold)
             pillFlashBtn.image = img.withSymbolConfiguration(cfg)
         }
-        pillFlashBtn.contentTintColor = tint
+        updateDockButtonStates()
     }
 
     private func updateFlashIconAndSend() {
@@ -2384,14 +2730,17 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
             videoView.flashDimFactor = 1.0
             _ = videoView.renderStudioProcessedPixelBuffer(updateHistory: true)
             sendCommand("FLASH:0")
+            sendCommand("EV:\(currentEV)")
         } else {
             let pct = max(1, min(100, currentFlashStrength))
             flashDimmerSlider?.intValue = Int32(pct)
             flashDimmerLabel?.stringValue = "\(pct)%"
-            videoView.flashDimFactor = 0.62 + 0.38 * (Float(pct) / 100.0)
+            videoView.flashDimFactor = 0.10 + 0.90 * powf(Float(pct) / 100.0, 1.30)
             _ = videoView.renderStudioProcessedPixelBuffer(updateHistory: true)
             sendCommand("FLASH:\(currentFlashMode)")
             sendCommand("TORCH_STRENGTH:\(pct)")
+            let dimEV = max(-12, currentEV - Int(round((1.0 - Float(pct) / 100.0) * 6.0)))
+            sendCommand("EV:\(dimEV)")
         }
     }
 
@@ -2402,11 +2751,19 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
 
     @objc private func onAFModeChanged() {
         currentAFMode = afModePopup.indexOfSelectedItem
+        isAFActive = (currentAFMode != 0)
         sendCommand("AFMODE:\(currentAFMode)")
+        updateDockButtonStates()
     }
 
     @objc private func onTriggerAF() {
+        showControlsAndResetTimer()
+        isAFActive.toggle()
         sendCommand("AF:TRIGGER")
+        wandBannerText = isAFActive ? "🎯 Autofocus Sweep & Lock ON" : "🎯 Continuous Video AF"
+        wandBannerUntil = CFAbsoluteTimeGetCurrent() + 2.0
+        pillStatusLabel.stringValue = wandBannerText
+        updateDockButtonStates()
     }
 
     @objc private func onAELockChanged() {
@@ -2417,10 +2774,26 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         sendCommand("AWBLOCK:\(awbLockCheck.state == .on ? 1 : 0)")
     }
 
-    @objc private func onZoomSliderChanged() {
-        currentZoom = Float(zoomSlider.doubleValue)
-        zoomLabel.stringValue = String(format: "%.1f×", currentZoom)
-        sendCommand(String(format: "ZOOM:%.2f", currentZoom))
+    private func syncAllZoomControls(_ z: Float, send: Bool = true) {
+        let clamped = max(1.0, min(6.0, z))
+        currentZoom = clamped
+        let fmt = String(format: "%.1f×", clamped)
+        topZoomSlider?.doubleValue = Double(clamped)
+        topZoomLabel?.stringValue = fmt
+        pillZoomSlider?.doubleValue = Double(clamped)
+        pillZoomLabel?.stringValue = fmt
+        if send {
+            sendCommand(String(format: "ZOOM:%.2f", clamped))
+        }
+    }
+
+    @objc private func onTopZoomSliderChanged() {
+        syncAllZoomControls(Float(topZoomSlider.doubleValue))
+    }
+
+    @objc private func onPillZoomSliderChanged() {
+        showControlsAndResetTimer()
+        syncAllZoomControls(Float(pillZoomSlider.doubleValue))
     }
 
     @objc private func onEVSliderChanged() {
@@ -2517,8 +2890,10 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
     }
 
     @objc private func onResetGrade() {
+        currentPreset = 1
         ispCheck.state = .on
         videoView.ispEnabled = true
+        videoView.warmthShift = 0.0
         brightnessSlider.doubleValue = 1.12
         shadowSlider.doubleValue = 0.16
         contrastSlider.doubleValue = 1.05
@@ -2526,10 +2901,14 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         denoiseSlider.doubleValue = 0.38
         sharpnessSlider.doubleValue = 0.52
         onGPUGradeChanged()
+        updateDockButtonStates()
     }
 
 
     @objc private func onResetAllDefaults() {
+        isWandModeActive = false
+        isAFActive = false
+        currentPreset = 1
         // 1. Reset Camera2 Hardware Controls (Shutter/FPS, Flash, WB, AF, Locks, Zoom, EV, Quality)
         if currentResIndex != 2 {
             currentResIndex = 2
@@ -2560,10 +2939,7 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         awbLockCheck.state = .off
         sendCommand("AWBLOCK:0")
 
-        currentZoom = 1.0
-        zoomSlider.doubleValue = 1.0
-        zoomLabel.stringValue = "1.0×"
-        sendCommand("ZOOM:1.00")
+        syncAllZoomControls(1.0)
 
         currentEV = 0
         evSlider.intValue = 0
@@ -2590,11 +2966,13 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         applyEffectiveRotation()
 
         // 4. Update HUD Banner & Telemetry
-        let msg = "↺ Reset Defaults • 1080p • 0 EV • 1.0× • Studio ISP Default"
+        let msg = "↺ Defaults • 1080p • 0EV • 1.0×"
         wandBannerText = msg
-        wandBannerUntil = CFAbsoluteTimeGetCurrent() + 3.2
+        wandBannerUntil = CFAbsoluteTimeGetCurrent() + 3.0
         pillStatusLabel.stringValue = msg
         aiTelemetryLabel.stringValue = "↺ All Camera2 Hardware & Metal Studio ISP settings restored to defaults"
+        updateDockButtonStates()
+        repositionOverlayPill()
     }
 
     @objc private func onScreenOffChanged() {
@@ -2646,12 +3024,20 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         do {
             try snap.data.write(to: fileURL, options: .atomic)
             NSSound.beep()
-            wandBannerText = "📸 Saved → ~/Downloads/\(fileURL.lastPathComponent)"
-            wandBannerUntil = CFAbsoluteTimeGetCurrent() + 3.2
+            let now = CFAbsoluteTimeGetCurrent()
+            snapActiveUntil = now + 2.2
+            wandBannerText = "📸 Saved JPEG → ~/Downloads"
+            wandBannerUntil = now + 2.6
             pillStatusLabel.stringValue = wandBannerText
+            pillStatusLabel.toolTip = "📸 Saved → ~/Downloads/\(fileURL.lastPathComponent)"
             aiTelemetryLabel.stringValue = "📸 Snapshot saved: ~/Downloads/\(fileURL.lastPathComponent)"
+            updateDockButtonStates()
+            repositionOverlayPill()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.25) { [weak self] in
+                self?.updateDockButtonStates()
+            }
         } catch {
-            wandBannerText = "⚠️ Snapshot failed: \(error.localizedDescription)"
+            wandBannerText = "⚠️ Snapshot failed"
             wandBannerUntil = CFAbsoluteTimeGetCurrent() + 3.0
         }
     }
@@ -2662,12 +3048,9 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
             let cfg = NSImage.SymbolConfiguration(pointSize: 13, weight: .semibold)
             pillRecordBtn.image = img.withSymbolConfiguration(cfg)
         }
-        pillRecordBtn.contentTintColor = recording ? NSColor.white : NSColor.systemRed
-        pillRecordBtn.layer?.backgroundColor = recording
-            ? NSColor.systemRed.withAlphaComponent(0.88).cgColor
-            : NSColor.white.withAlphaComponent(0.10).cgColor
         recordBtn.title = recording ? "⏹ Stop REC [V]" : "⏺ Record MP4 [V]"
         recordBtn.contentTintColor = recording ? .systemOrange : .systemRed
+        updateDockButtonStates()
     }
 
     @objc private func onToggleRecording() {
@@ -2678,14 +3061,16 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
                 NSSound.beep()
                 if let url = savedURL {
                     let durStr = String(format: "%.1fs", duration)
-                    self.wandBannerText = "🎬 Saved (\(durStr)) → ~/Downloads/\(url.lastPathComponent)"
-                    self.wandBannerUntil = CFAbsoluteTimeGetCurrent() + 4.0
+                    self.wandBannerText = "🎬 Saved MP4 (\(durStr)) → Downloads"
+                    self.wandBannerUntil = CFAbsoluteTimeGetCurrent() + 3.5
                     self.pillStatusLabel.stringValue = self.wandBannerText
+                    self.pillStatusLabel.toolTip = "🎬 Saved (\(durStr)) → ~/Downloads/\(url.lastPathComponent)"
                     self.aiTelemetryLabel.stringValue = "🎬 MP4 saved (\(frames)f, \(durStr)): ~/Downloads/\(url.lastPathComponent)"
                 } else {
-                    self.wandBannerText = "⚠️ Recording failed to finalize"
+                    self.wandBannerText = "⚠️ Recording failed"
                     self.wandBannerUntil = CFAbsoluteTimeGetCurrent() + 3.0
                 }
+                self.repositionOverlayPill()
             }
         } else {
             let rawW = max(2, videoView.frameWidth)
@@ -2702,12 +3087,14 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
             if res.started {
                 updateRecordingButtonsUI(recording: true)
                 NSSound.beep()
-                wandBannerText = "🔴 REC \(res.width)×\(res.height) → ~/Downloads/\(targetURL.lastPathComponent)"
-                wandBannerUntil = CFAbsoluteTimeGetCurrent() + 2.5
+                wandBannerText = "🔴 REC MP4 • \(res.width)×\(res.height)"
+                wandBannerUntil = CFAbsoluteTimeGetCurrent() + 2.2
                 pillStatusLabel.stringValue = wandBannerText
+                pillStatusLabel.toolTip = "🔴 Recording MP4 to ~/Downloads/\(targetURL.lastPathComponent)"
                 aiTelemetryLabel.stringValue = "🔴 Recording MP4 to ~/Downloads/\(targetURL.lastPathComponent)"
+                repositionOverlayPill()
             } else {
-                wandBannerText = "⚠️ Could not start MP4 recorder"
+                wandBannerText = "⚠️ Recorder error"
                 wandBannerUntil = CFAbsoluteTimeGetCurrent() + 3.0
             }
         }
@@ -2727,7 +3114,7 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         guard let chars = event.charactersIgnoringModifiers?.lowercased() else { return false }
         switch chars {
         case "w":
-            onMagicWandAutoTune()
+            onPillWandButtonClicked()
             return true
         case "d", "0":
             onResetAllDefaults()
@@ -2770,12 +3157,10 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
             onRotate90()
             return true
         case "+", "=":
-            zoomSlider.doubleValue = min(zoomSlider.doubleValue + 0.25, 6.0)
-            onZoomSliderChanged()
+            syncAllZoomControls(min(currentZoom + 0.25, 6.0))
             return true
         case "-", "_":
-            zoomSlider.doubleValue = max(zoomSlider.doubleValue - 0.25, 1.0)
-            onZoomSliderChanged()
+            syncAllZoomControls(max(currentZoom - 0.25, 1.0))
             return true
         case "]":
             evSlider.intValue = min(evSlider.intValue + 1, 12)
@@ -2811,12 +3196,14 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
 
     private func sendCommand(_ cmd: String) {
         commandQueue.async { [weak self] in
-            guard let self = self, let out = self.outputStream else { return }
+            guard let self = self else { return }
+            let sock = self.activeClientSocket
+            guard sock >= 0 else { return }
             let line = cmd + "\n"
             if let data = line.data(using: .utf8) {
                 data.withUnsafeBytes { rawBuf in
-                    guard let base = rawBuf.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
-                    _ = out.write(base, maxLength: data.count)
+                    guard let base = rawBuf.baseAddress else { return }
+                    _ = Darwin.send(sock, base, data.count, 0)
                 }
             }
         }
@@ -2851,15 +3238,24 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
                     let mm = recSec / 60
                     let ss = recSec % 60
                     self.pillStatusLabel.stringValue = String(
-                        format: "🔴 REC %02d:%02d • %dx%d • %.0f fps",
-                        mm, ss, dispW, dispH, self.measuredFPS
+                        format: "🔴 REC %02d:%02d • %dx%d",
+                        mm, ss, dispW, dispH
                     )
                 } else {
                     self.pillStatusLabel.stringValue = String(format: "%dx%d • %.0f fps • %@", dispW, dispH, self.measuredFPS, lensName)
                 }
             } else {
                 self.pillStatusDot.textColor = NSColor.systemOrange
-                self.pillStatusLabel.stringValue = "Reconnecting USB..."
+                self.pillStatusLabel.stringValue = "Searching USB / Wi-Fi..."
+            }
+            self.updateDockButtonStates()
+            if let videoWindow = self.videoWindow, let overlayPillWindow = self.overlayPillWindow {
+                let contentRect = videoWindow.contentRect(forFrameRect: videoWindow.frame)
+                let expectedWidth = min(668, max(480, contentRect.width - 20))
+                let expectedX = round(contentRect.origin.x + (contentRect.width - expectedWidth) / 2.0)
+                if abs(overlayPillWindow.frame.width - expectedWidth) > 0.5 || abs(overlayPillWindow.frame.origin.x - expectedX) > 0.5 {
+                    self.repositionOverlayPill()
+                }
             }
         }
     }
@@ -2895,19 +3291,166 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
                     failedAttempts = 0
                 } else {
                     failedAttempts += 1
-                    if failedAttempts >= 2 {
+                    if failedAttempts >= 1 {
                         self.ensureAndroidServerIfNeeded()
                     }
+                    if failedAttempts % 3 == 0 {
+                        if let discovered = self.scanLANForPxlCamDevice(port: 9876) {
+                            UserDefaults.standard.set(discovered, forKey: "PxlCamLastDeviceIP")
+                        }
+                    }
                 }
-                Thread.sleep(forTimeInterval: 0.30)
+                Thread.sleep(forTimeInterval: 0.25)
             }
         }
     }
 
-    private func readExact(from stream: InputStream, into buffer: UnsafeMutablePointer<UInt8>, length: Int) -> Bool {
+    private func envWirelessHost() -> String? {
+        let envPath = "/Users/aaryn/Projects/pxl-cam/.env"
+        guard let content = try? String(contentsOfFile: envPath, encoding: .utf8) else { return nil }
+        for line in content.split(whereSeparator: \.isNewline) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("ADB_WIRELESS_HOST=") {
+                let val = String(trimmed.dropFirst("ADB_WIRELESS_HOST=".count))
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "\"' "))
+                if !val.isEmpty {
+                    return val
+                }
+            }
+        }
+        return nil
+    }
+
+    private func candidateDeviceHosts() -> [String] {
+        var hosts: [String] = ["127.0.0.1"]
+        if let saved = UserDefaults.standard.string(forKey: "PxlCamLastDeviceIP"), !saved.isEmpty {
+            hosts.append(saved)
+        }
+        if let envHost = envWirelessHost(), !envHost.isEmpty {
+            hosts.append(envHost)
+        }
+        hosts.append("192.168.1.82")
+        var seen = Set<String>()
+        return hosts.filter { seen.insert($0).inserted }
+    }
+
+    private func connectSocketWithTimeout(host: String, port: UInt16, timeoutMs: Int32) -> Int32 {
+        let ipAddr = inet_addr(host)
+        guard ipAddr != INADDR_NONE else { return -1 }
+
+        let sock = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        guard sock >= 0 else { return -1 }
+
+        var noSigPipe: Int32 = 1
+        setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+
+        let flags = fcntl(sock, F_GETFL, 0)
+        _ = fcntl(sock, F_SETFL, flags | O_NONBLOCK)
+
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian
+        addr.sin_addr.s_addr = ipAddr
+
+        let res = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(sock, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+
+        if res < 0 && errno != EINPROGRESS {
+            Darwin.close(sock)
+            return -1
+        }
+
+        if res != 0 {
+            var pfd = pollfd(fd: sock, events: Int16(POLLOUT), revents: 0)
+            let pollRes = Darwin.poll(&pfd, 1, timeoutMs)
+            if pollRes <= 0 || (pfd.revents & Int16(POLLERR | POLLHUP)) != 0 {
+                Darwin.close(sock)
+                return -1
+            }
+            var soError: Int32 = 0
+            var len = socklen_t(MemoryLayout<Int32>.size)
+            if getsockopt(sock, SOL_SOCKET, SO_ERROR, &soError, &len) < 0 || soError != 0 {
+                Darwin.close(sock)
+                return -1
+            }
+        }
+
+        _ = fcntl(sock, F_SETFL, flags)
+        var one: Int32 = 1
+        setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, socklen_t(MemoryLayout<Int32>.size))
+        var tv = timeval(tv_sec: 2, tv_usec: 0)
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        return sock
+    }
+
+    private func scanLANForPxlCamDevice(port: UInt16 = 9876) -> String? {
+        var prefixes: [String] = []
+        var ifaddrPtr: UnsafeMutablePointer<ifaddrs>?
+        if getifaddrs(&ifaddrPtr) == 0, let firstAddr = ifaddrPtr {
+            defer { freeifaddrs(ifaddrPtr) }
+            var ptr: UnsafeMutablePointer<ifaddrs>? = firstAddr
+            while let cur = ptr {
+                let flags = Int32(cur.pointee.ifa_flags)
+                if (flags & IFF_UP) != 0 && (flags & IFF_LOOPBACK) == 0,
+                   let addr = cur.pointee.ifa_addr, addr.pointee.sa_family == UInt8(AF_INET) {
+                    var hostBuf = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                    if getnameinfo(addr, socklen_t(addr.pointee.sa_len), &hostBuf, socklen_t(hostBuf.count), nil, 0, NI_NUMERICHOST) == 0 {
+                        let ip = String(cString: hostBuf)
+                        let parts = ip.split(separator: ".")
+                        if parts.count == 4 && (parts[0] == "192" || parts[0] == "10" || parts[0] == "172") {
+                            let prefix = "\(parts[0]).\(parts[1]).\(parts[2])."
+                            if !prefixes.contains(prefix) {
+                                prefixes.append(prefix)
+                            }
+                        }
+                    }
+                }
+                ptr = cur.pointee.ifa_next
+            }
+        }
+        if prefixes.isEmpty {
+            prefixes = ["192.168.1."]
+        }
+
+        let lock = NSLock()
+        var foundHost: String? = nil
+        let sem = DispatchSemaphore(value: 32)
+
+        for prefix in prefixes {
+            DispatchQueue.concurrentPerform(iterations: 254) { idx in
+                lock.lock()
+                let alreadyFound = (foundHost != nil)
+                lock.unlock()
+                if alreadyFound { return }
+
+                sem.wait()
+                defer { sem.signal() }
+
+                let candidate = "\(prefix)\(idx + 1)"
+                let s = self.connectSocketWithTimeout(host: candidate, port: port, timeoutMs: 160)
+                if s >= 0 {
+                    Darwin.close(s)
+                    lock.lock()
+                    if foundHost == nil {
+                        foundHost = candidate
+                    }
+                    lock.unlock()
+                }
+            }
+            if foundHost != nil { break }
+        }
+        return foundHost
+    }
+
+    private func readExact(from sock: Int32, into buffer: UnsafeMutablePointer<UInt8>, length: Int) -> Bool {
         var totalRead = 0
         while totalRead < length {
-            let n = stream.read(buffer.advanced(by: totalRead), maxLength: length - totalRead)
+            let n = Darwin.recv(sock, buffer.advanced(by: totalRead), length - totalRead, 0)
             if n <= 0 {
                 return false
             }
@@ -2917,35 +3460,39 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
     }
 
     private func connectAndReceiveLoop() -> Bool {
-        var readStream: Unmanaged<CFReadStream>?
-        var writeStream: Unmanaged<CFWriteStream>?
-        CFStreamCreatePairWithSocketToHost(kCFAllocatorDefault, "127.0.0.1" as CFString, 9876, &readStream, &writeStream)
+        for host in candidateDeviceHosts() {
+            let timeoutMs: Int32 = (host == "127.0.0.1") ? 280 : 500
+            let sock = connectSocketWithTimeout(host: host, port: 9876, timeoutMs: timeoutMs)
+            if sock < 0 { continue }
 
-        guard let input = readStream?.takeRetainedValue() as InputStream?,
-              let output = writeStream?.takeRetainedValue() as OutputStream? else {
-            return false
+            if receiveStreamFromSocket(sock, host: host) {
+                if host != "127.0.0.1" {
+                    UserDefaults.standard.set(host, forKey: "PxlCamLastDeviceIP")
+                }
+                return true
+            }
         }
+        return false
+    }
 
-        input.open()
-        output.open()
+    private func receiveStreamFromSocket(_ sock: Int32, host: String) -> Bool {
         commandQueue.sync {
-            self.outputStream = output
+            self.activeClientSocket = sock
         }
 
         var receivedAnyFrame = false
         let headerBuf = UnsafeMutablePointer<UInt8>.allocate(capacity: 26)
         defer {
             headerBuf.deallocate()
-            input.close()
-            output.close()
             commandQueue.sync {
-                self.outputStream = nil
+                self.activeClientSocket = -1
             }
+            Darwin.close(sock)
             self.isConnected = false
         }
 
         while true {
-            guard readExact(from: input, into: headerBuf, length: 26) else {
+            guard readExact(from: sock, into: headerBuf, length: 26) else {
                 break
             }
             let magic = (UInt32(headerBuf[0]) << 24) | (UInt32(headerBuf[1]) << 16) | (UInt32(headerBuf[2]) << 8) | UInt32(headerBuf[3])
@@ -2954,10 +3501,16 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
             }
             let codec = Int(headerBuf[4]) // Byte 4: 2 = Hardware Video ISP H.264, 1 = JPEG
             let packedCamAndRot = Int(headerBuf[5]) // Byte 5: bits 0..1 = camera, bits 2..3 = autoRotationQuadrants
-            let phoneRot = (packedCamAndRot >> 2) & 0x03
+            let phoneCam = packedCamAndRot & 0x03
+            let rawPhoneRot = (packedCamAndRot >> 2) & 0x03
             let width = Int((UInt16(headerBuf[6]) << 8) | UInt16(headerBuf[7]))
             let height = Int((UInt16(headerBuf[8]) << 8) | UInt16(headerBuf[9]))
+            let seqOrBitrate = Int((UInt32(headerBuf[10]) << 24) | (UInt32(headerBuf[11]) << 16) | (UInt32(headerBuf[12]) << 8) | UInt32(headerBuf[13]))
             let payloadLen = Int((UInt32(headerBuf[22]) << 24) | (UInt32(headerBuf[23]) << 16) | (UInt32(headerBuf[24]) << 8) | UInt32(headerBuf[25]))
+
+            // PxlCamEngine.kt in com.pxlcam.app sends bitrate 12_000_000 in bytes 10..13 and static sensor mount angle in rawPhoneRot;
+            // normalize static sensor mount angle to 0 (16:9 landscape) so it matches the 1920x1080 stream unless manually rotated.
+            let phoneRot = (seqOrBitrate == 12_000_000) ? 0 : rawPhoneRot
 
             if payloadLen <= 0 || payloadLen > 16_000_000 {
                 break
@@ -2966,10 +3519,19 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
             var frameData = Data(count: payloadLen)
             let ok = frameData.withUnsafeMutableBytes { rawBuf -> Bool in
                 guard let base = rawBuf.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return false }
-                return self.readExact(from: input, into: base, length: payloadLen)
+                return self.readExact(from: sock, into: base, length: payloadLen)
             }
             if !ok {
                 break
+            }
+
+            if phoneCam != self.currentLens {
+                self.currentLens = phoneCam
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    self.lensPopup?.selectItem(at: phoneCam)
+                    self.updateDockButtonStates()
+                }
             }
 
             if phoneRot != self.sensorRotationQuadrants {
@@ -3202,42 +3764,61 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
     }
 
     private var obsPresetIndex: Int {
-        if !videoView.ispEnabled { return 0 }
-        if videoView.brightnessGain > 1.22 { return 2 }
-        if videoView.sharpenStrength > 0.65 { return 3 }
-        return 1
+        return currentPreset
+    }
+
+    private var isAtDefaultSettings: Bool {
+        return !isWandModeActive &&
+            currentPreset == 1 &&
+            currentFlashMode == 0 &&
+            abs(currentZoom - 1.0) < 0.02 &&
+            currentEV == 0 &&
+            currentWBMode == 0 &&
+            manualRotationQuadrants == 0 &&
+            !videoView.mirrorHorizontal &&
+            !videoView.flipVertical &&
+            abs(videoView.warmthShift) < 0.01
     }
 
     private func buildOBSBridgeStateJSON() -> String {
-        let wandActive = CFAbsoluteTimeGetCurrent() < wandBannerUntil
-        let effectiveFlashLevel = (currentFlashMode == 0) ? 0 : currentFlashStrength
-        return String(
-            format: """
-            {"connected":%@,"fps":%.1f,"frameW":%d,"frameH":%d,"camera":%d,"flash":%@,"flashLevel":%d,"ev":%d,"zoom":%.2f,"wb":%d,"af":%d,"preset":%d,"wand":%@,"rotation":%d,"mirrorH":%@,"mirrorV":%@,"denoise":%.3f,"sharpness":%.3f,"brightness":%.3f,"contrast":%.3f,"saturation":%.3f,"warmth":0.000,"tint":0.000,"shadowLift":%.3f,"highlightRoll":0.150,"skinProtect":0.500,"blackPoint":0.008}
-            """,
-            isConnected ? "true" : "false",
-            measuredFPS,
-            videoView.frameWidth,
-            videoView.frameHeight,
-            currentLens,
-            (currentFlashMode != 0) ? "true" : "false",
-            effectiveFlashLevel,
-            currentEV,
-            currentZoom,
-            currentWBMode,
-            currentAFMode,
-            obsPresetIndex,
-            wandActive ? "true" : "false",
-            manualRotationQuadrants,
-            videoView.mirrorHorizontal ? "true" : "false",
-            videoView.flipVertical ? "true" : "false",
-            videoView.denoiseStrength,
-            videoView.sharpenStrength,
-            videoView.brightnessGain,
-            videoView.contrastBoost,
-            videoView.saturationBoost,
-            videoView.shadowLift
-        )
+        let onMainBlock: () -> String = {
+            let wandActive = self.isWandModeActive || (CFAbsoluteTimeGetCurrent() < self.wandBannerUntil && self.wandBannerText.hasPrefix("✨"))
+            let effectiveFlashLevel = (self.currentFlashMode == 0) ? 0 : self.currentFlashStrength
+            return String(
+                format: """
+                {"connected":%@,"fps":%.1f,"frameW":%d,"frameH":%d,"camera":%d,"flash":%@,"flashLevel":%d,"ev":%d,"zoom":%.2f,"wb":%d,"af":%d,"preset":%d,"wand":%@,"isDefault":%@,"rotation":%d,"mirrorH":%@,"mirrorV":%@,"denoise":%.3f,"sharpness":%.3f,"brightness":%.3f,"contrast":%.3f,"saturation":%.3f,"warmth":%.3f,"tint":0.000,"shadowLift":%.3f,"highlightRoll":0.150,"skinProtect":0.500,"blackPoint":0.008}
+                """,
+                self.isConnected ? "true" : "false",
+                self.measuredFPS,
+                self.videoView.frameWidth,
+                self.videoView.frameHeight,
+                self.currentLens,
+                (self.currentFlashMode != 0) ? "true" : "false",
+                effectiveFlashLevel,
+                self.currentEV,
+                self.currentZoom,
+                self.currentWBMode,
+                self.currentAFMode,
+                self.obsPresetIndex,
+                wandActive ? "true" : "false",
+                self.isAtDefaultSettings ? "true" : "false",
+                self.manualRotationQuadrants,
+                self.videoView.mirrorHorizontal ? "true" : "false",
+                self.videoView.flipVertical ? "true" : "false",
+                self.videoView.denoiseStrength,
+                self.videoView.sharpenStrength,
+                self.videoView.brightnessGain,
+                self.videoView.contrastBoost,
+                self.videoView.saturationBoost,
+                self.videoView.warmthShift,
+                self.videoView.shadowLift
+            )
+        }
+        if Thread.isMainThread {
+            return onMainBlock()
+        } else {
+            return DispatchQueue.main.sync(execute: onMainBlock)
+        }
     }
 
     private func applyOBSBridgeControlQuery(_ query: String) {
@@ -3250,7 +3831,7 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
                 params[k] = v
             }
         }
-        DispatchQueue.main.async { [weak self] in
+        let applyBlock: () -> Void = { [weak self] in
             guard let self = self else { return }
             if let lensStr = params["lens"], let lens = Int(lensStr) {
                 self.currentLens = (lens == 1) ? 1 : 0
@@ -3287,10 +3868,7 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
                 self.sendCommand("EV:\(self.currentEV)")
             }
             if let zoomStr = params["zoom"], let z = Float(zoomStr) {
-                self.currentZoom = max(1.0, min(4.0, z))
-                self.zoomSlider?.doubleValue = Double(self.currentZoom)
-                self.zoomLabel?.stringValue = String(format: "%.1f×", self.currentZoom)
-                self.sendCommand(String(format: "ZOOM:%.2f", self.currentZoom))
+                self.syncAllZoomControls(max(1.0, min(6.0, z)))
             }
             if let wbStr = params["wb"], let wb = Int(wbStr), (0...5).contains(wb) {
                 self.currentWBMode = wb
@@ -3302,17 +3880,32 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
                 self.afModePopup?.selectItem(at: af)
                 self.sendCommand("AFMODE:\(af)")
             }
-            if let wandStr = params["wand"], wandStr == "1" || wandStr == "trigger" {
-                self.onMagicWandAutoTune()
+            if let wandStr = params["wand"] {
+                if wandStr == "toggle" {
+                    if self.isWandModeActive {
+                        self.isWandModeActive = false
+                        self.onResetGrade()
+                    } else {
+                        self.onMagicWandAutoTune()
+                    }
+                } else if wandStr == "1" || wandStr == "trigger" {
+                    self.onMagicWandAutoTune()
+                } else if wandStr == "0" || wandStr == "false" {
+                    self.isWandModeActive = false
+                    self.onResetGrade()
+                }
             }
             if let resetStr = params["reset"], resetStr == "1" {
                 self.onResetAllDefaults()
             }
-            if let presetStr = params["preset"], let p = Int(presetStr) {
+            if let presetStr = params["preset"], let p = Int(presetStr), (0...6).contains(p) {
+                self.isWandModeActive = false
+                self.currentPreset = p
+                self.ispCheck?.state = .on
+                self.videoView.ispEnabled = true
                 switch p {
                 case 0: // Natural (ISP minimal)
-                    self.ispCheck?.state = .on
-                    self.videoView.ispEnabled = true
+                    self.videoView.warmthShift = 0.0
                     self.brightnessSlider?.doubleValue = 1.00
                     self.shadowSlider?.doubleValue = 0.04
                     self.contrastSlider?.doubleValue = 1.00
@@ -3320,11 +3913,10 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
                     self.denoiseSlider?.doubleValue = 0.15
                     self.sharpnessSlider?.doubleValue = 0.25
                     self.onGPUGradeChanged()
-                case 1: // Studio Clean
+                case 1: // Studio Default
                     self.onResetGrade()
-                case 2: // Low-Light Boost
-                    self.ispCheck?.state = .on
-                    self.videoView.ispEnabled = true
+                case 2: // Broadcast (Low-Light Boost)
+                    self.videoView.warmthShift = 0.0
                     self.brightnessSlider?.doubleValue = 1.28
                     self.shadowSlider?.doubleValue = 0.28
                     self.contrastSlider?.doubleValue = 1.08
@@ -3332,15 +3924,41 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
                     self.denoiseSlider?.doubleValue = 0.52
                     self.sharpnessSlider?.doubleValue = 0.48
                     self.onGPUGradeChanged()
-                case 3: // Crisp Broadcast
-                    self.ispCheck?.state = .on
-                    self.videoView.ispEnabled = true
-                    self.brightnessSlider?.doubleValue = 1.08
-                    self.shadowSlider?.doubleValue = 0.12
-                    self.contrastSlider?.doubleValue = 1.12
+                case 3: // Cinema (Rich contrast + warm filmic tone)
+                    self.videoView.warmthShift = 0.08
+                    self.brightnessSlider?.doubleValue = 1.06
+                    self.shadowSlider?.doubleValue = 0.10
+                    self.contrastSlider?.doubleValue = 1.18
+                    self.saturationSlider?.doubleValue = 1.08
+                    self.denoiseSlider?.doubleValue = 0.34
+                    self.sharpnessSlider?.doubleValue = 0.62
+                    self.onGPUGradeChanged()
+                case 4: // Clean (Extra smooth 3DNR + neutral balance)
+                    self.videoView.warmthShift = -0.04
+                    self.brightnessSlider?.doubleValue = 1.14
+                    self.shadowSlider?.doubleValue = 0.20
+                    self.contrastSlider?.doubleValue = 1.03
+                    self.saturationSlider?.doubleValue = 1.01
+                    self.denoiseSlider?.doubleValue = 0.68
+                    self.sharpnessSlider?.doubleValue = 0.44
+                    self.onGPUGradeChanged()
+                case 5: // Warm (Golden indoor warmth + soft shadows)
+                    self.videoView.warmthShift = 0.24
+                    self.brightnessSlider?.doubleValue = 1.14
+                    self.shadowSlider?.doubleValue = 0.18
+                    self.contrastSlider?.doubleValue = 1.05
+                    self.saturationSlider?.doubleValue = 1.10
+                    self.denoiseSlider?.doubleValue = 0.40
+                    self.sharpnessSlider?.doubleValue = 0.50
+                    self.onGPUGradeChanged()
+                case 6: // Crisp (High-clarity detail + punchy micro-contrast)
+                    self.videoView.warmthShift = 0.0
+                    self.brightnessSlider?.doubleValue = 1.10
+                    self.shadowSlider?.doubleValue = 0.14
+                    self.contrastSlider?.doubleValue = 1.14
                     self.saturationSlider?.doubleValue = 1.06
-                    self.denoiseSlider?.doubleValue = 0.25
-                    self.sharpnessSlider?.doubleValue = 0.78
+                    self.denoiseSlider?.doubleValue = 0.22
+                    self.sharpnessSlider?.doubleValue = 0.88
                     self.onGPUGradeChanged()
                 default:
                     break
@@ -3380,7 +3998,7 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
                 ispUpdated = true
             }
             if let s = params["shadowLift"], let v = Float(s) {
-                self.shadowSlider?.doubleValue = Double(max(0, min(0.8, v)))
+                self.shadowSlider?.doubleValue = Double(max(-0.25, min(0.8, v)))
                 ispUpdated = true
             }
             if let s = params["contrast"], let v = Float(s) {
@@ -3391,10 +4009,20 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
                 self.saturationSlider?.doubleValue = Double(max(0, min(1.8, v)))
                 ispUpdated = true
             }
+            if let s = params["warmth"], let v = Float(s) {
+                self.videoView.warmthShift = max(-0.5, min(0.5, v))
+                ispUpdated = true
+            }
 
             if ispUpdated {
                 self.onGPUGradeChanged()
             }
+            self.updateDockButtonStates()
+        }
+        if Thread.isMainThread {
+            applyBlock()
+        } else {
+            DispatchQueue.main.sync(execute: applyBlock)
         }
     }
 
@@ -3502,20 +4130,44 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
       .row { display: flex; gap: 5px; flex-wrap: wrap; margin-bottom: 6px; }
       .row:last-child { margin-bottom: 0; }
       button {
-        flex: 1; min-width: 44px; padding: 5px 6px;
-        background: rgba(255, 255, 255, 0.05); color: var(--text);
-        border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 6px;
+        flex: 1; min-width: 44px; padding: 5px 7px;
+        display: inline-flex; align-items: center; justify-content: space-between; gap: 5px;
+        background: rgba(255, 255, 255, 0.045); color: #B8C0D0;
+        border: 1px solid rgba(255, 255, 255, 0.13); border-radius: 6px;
         font-size: 10.5px; font-weight: 600; cursor: pointer;
         transition: all 0.12s ease;
       }
-      button:hover { border-color: var(--orange); background: rgba(255, 132, 0, 0.10); }
+      button:hover { border-color: var(--orange); background: rgba(255, 132, 0, 0.12); color: #FFFFFF; }
       button.active {
-        background: var(--orange-dim); color: var(--orange);
-        border-color: var(--orange); font-weight: 700;
+        background: linear-gradient(135deg, rgba(255, 132, 0, 0.28), rgba(25, 230, 115, 0.14));
+        color: #FFFFFF;
+        border-color: var(--orange);
+        box-shadow: 0 0 8px rgba(255, 132, 0, 0.28);
+        font-weight: 700;
       }
       button.wand {
-        background: linear-gradient(135deg, rgba(255,132,0,0.28), rgba(255,180,0,0.18));
-        border-color: var(--orange); color: #FFD494; font-weight: 800;
+        background: rgba(255, 180, 0, 0.10);
+        border-color: rgba(255, 180, 0, 0.35); color: #FFE2B0; font-weight: 700;
+      }
+      button.wand.active {
+        background: linear-gradient(135deg, rgba(255, 132, 0, 0.38), rgba(255, 204, 0, 0.26));
+        border-color: #FFB800; color: #FFFFFF;
+        box-shadow: 0 0 10px rgba(255, 184, 0, 0.35);
+      }
+      .state-pill {
+        font-family: ui-monospace, SFMono-Regular, monospace;
+        font-size: 8.5px; font-weight: 800; letter-spacing: 0.3px;
+        padding: 1.5px 4.5px; border-radius: 4px;
+        background: rgba(255, 255, 255, 0.08);
+        color: #7E8696;
+        border: 1px solid rgba(255, 255, 255, 0.10);
+        line-height: 1.1;
+        flex-shrink: 0;
+      }
+      button.active .state-pill {
+        background: rgba(25, 230, 115, 0.22);
+        color: #19E673;
+        border-color: rgba(25, 230, 115, 0.55);
       }
       .slider-row {
         display: grid; grid-template-columns: 68px 1fr 42px;
@@ -3562,95 +4214,95 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
       <div class="section">
         <div class="section-title">Quick Actions & Hardware</div>
         <div class="row">
-          <button class="wand" id="btnWand" onclick="sendCtrl('wand=1')">✨ Auto Studio Wand</button>
-          <button onclick="sendCtrl('reset=1')">↺ Reset</button>
+          <button class="wand" id="btnWand" title="AI Magic Wand: Toggle Auto-Tune Exposure, White Balance & Metal Studio ISP [W]" onclick="sendCtrl('wand=toggle')"><span>✨ Auto Studio Wand</span><span class="state-pill" id="pillWand">OFF</span></button>
+          <button id="btnReset" title="Reset all Camera2 Hardware & Metal Studio ISP settings to defaults [D]" onclick="sendCtrl('reset=1')"><span>↺ Defaults</span><span class="state-pill" id="pillReset">ON</span></button>
         </div>
         <div class="row">
-          <button id="lens0" onclick="sendCtrl('lens=0')">Back Lens</button>
-          <button id="lens1" onclick="sendCtrl('lens=1')">Front Lens</button>
-          <button id="btnFlash" onclick="sendCtrl('flash=toggle')">⚡ Flash</button>
+          <button id="lens0" title="Switch to Back Wide Camera (0) [F]" onclick="sendCtrl('lens=0')"><span>Back Lens</span><span class="state-pill" id="pillLens0">ON</span></button>
+          <button id="lens1" title="Switch to Front Selfie Camera (1) [F]" onclick="sendCtrl('lens=1')"><span>Front Lens</span><span class="state-pill" id="pillLens1">OFF</span></button>
+          <button id="btnFlash" title="Toggle Rear LED Torch Flash On / Off [T]" onclick="sendCtrl('flash=toggle')"><span>⚡ Flash</span><span class="state-pill" id="pillFlash">OFF</span></button>
         </div>
-        <div class="slider-row" style="margin-top:4px; margin-bottom:6px;">
+        <div class="slider-row" style="margin-top:4px; margin-bottom:5px;" title="Torch / Flash Dimmer (0% = OFF, 1%–100% = Smooth Optical + AE Torch Dimming)">
           <span class="slider-label">⚡ Dimmer</span>
           <input type="range" id="slFlashLevel" min="0" max="100" step="1" value="0" oninput="onSlider('flashLevel', this.value)" />
           <span class="slider-val" id="valFlashLevel">OFF</span>
         </div>
+        <div class="slider-row" style="margin-bottom:6px;" title="Hardware Sensor Zoom Level (1.0× – 6.0×) [+ / -]">
+          <span class="slider-label">🔍 Zoom</span>
+          <input type="range" id="slQuickZoom" min="1.0" max="6.0" step="0.05" value="1.0" oninput="onSlider('zoom', this.value)" />
+          <span class="slider-val" id="valQuickZoom">1.0×</span>
+        </div>
         <div class="row">
-          <button onclick="sendCtrl('rotate=step')">↻ Rotate 90°</button>
-          <button id="btnMirrorH" onclick="sendCtrl('mirrorH=toggle')">⇄ Flip H</button>
-          <button id="btnMirrorV" onclick="sendCtrl('mirrorV=toggle')">⇅ Flip V</button>
+          <button id="btnRotate" title="Rotate video 90° clockwise [R]" onclick="sendCtrl('rotate=step')"><span>↻ Rotate</span><span class="state-pill" id="pillRotate">OFF 0°</span></button>
+          <button id="btnMirrorH" title="Mirror video horizontally (Left ↔ Right) [M]" onclick="sendCtrl('mirrorH=toggle')"><span>⇄ Flip H</span><span class="state-pill" id="pillMirrorH">OFF</span></button>
+          <button id="btnMirrorV" title="Flip video vertically (Top ↔ Bottom)" onclick="sendCtrl('mirrorV=toggle')"><span>⇅ Flip V</span><span class="state-pill" id="pillMirrorV">OFF</span></button>
         </div>
       </div>
 
       <div class="section">
         <div class="section-title">Studio Look Presets</div>
         <div class="row">
-          <button id="preset0" onclick="sendCtrl('preset=0')">Natural</button>
-          <button id="preset1" onclick="sendCtrl('preset=1')">Studio</button>
-          <button id="preset2" onclick="sendCtrl('preset=2')">Broadcast</button>
-          <button id="preset3" onclick="sendCtrl('preset=3')">Cinema</button>
+          <button id="preset0" title="Natural Look (Minimal ISP grading)" onclick="sendCtrl('preset=0')"><span>Natural</span><span class="state-pill" id="pillPreset0">OFF</span></button>
+          <button id="preset1" title="Studio Default (Balanced brightness, shadow lift & 3DNR)" onclick="sendCtrl('preset=1')"><span>Studio</span><span class="state-pill" id="pillPreset1">ON</span></button>
+          <button id="preset2" title="Low-Light Boost (Lifted shadows + stronger 3DNR)" onclick="sendCtrl('preset=2')"><span>Broadcast</span><span class="state-pill" id="pillPreset2">OFF</span></button>
+          <button id="preset3" title="Cinema Look (Rich contrast + warm filmic tone)" onclick="sendCtrl('preset=3')"><span>Cinema</span><span class="state-pill" id="pillPreset3">OFF</span></button>
         </div>
         <div class="row">
-          <button id="preset4" onclick="sendCtrl('preset=4')">Clean</button>
-          <button id="preset5" onclick="sendCtrl('preset=5')">Warm</button>
-          <button id="preset6" onclick="sendCtrl('preset=6')">Crisp</button>
+          <button id="preset4" title="Clean Studio Look (Extra smooth 3DNR)" onclick="sendCtrl('preset=4')"><span>Clean</span><span class="state-pill" id="pillPreset4">OFF</span></button>
+          <button id="preset5" title="Warm Indoor Look (Golden indoor warmth)" onclick="sendCtrl('preset=5')"><span>Warm</span><span class="state-pill" id="pillPreset5">OFF</span></button>
+          <button id="preset6" title="Crisp Detail Look (High-clarity detail)" onclick="sendCtrl('preset=6')"><span>Crisp</span><span class="state-pill" id="pillPreset6">OFF</span></button>
         </div>
       </div>
 
       <div class="section">
         <div class="section-title">Hardware Sensor (Camera2)</div>
-        <div class="slider-row">
+        <div class="slider-row" title="Hardware Sensor Exposure Compensation (-8 EV to +8 EV) [[ / ]]">
           <span class="slider-label">HW EV</span>
           <input type="range" id="slEv" min="-8" max="8" step="1" value="0" oninput="onSlider('ev', this.value)" />
           <span class="slider-val" id="valEv">0</span>
         </div>
-        <div class="slider-row">
-          <span class="slider-label">HW Zoom</span>
-          <input type="range" id="slZoom" min="1.0" max="4.0" step="0.1" value="1.0" oninput="onSlider('zoom', this.value)" />
-          <span class="slider-val" id="valZoom">1.0x</span>
-        </div>
         <div class="row" style="margin-top:6px;">
-          <button id="wb0" onclick="sendCtrl('wb=0')">AWB</button>
-          <button id="wb1" onclick="sendCtrl('wb=1')">Day</button>
-          <button id="wb2" onclick="sendCtrl('wb=2')">Cloud</button>
-          <button id="wb3" onclick="sendCtrl('wb=3')">Tung</button>
-          <button id="wb4" onclick="sendCtrl('wb=4')">Fluo</button>
+          <button id="wb0" title="Auto White Balance (AWB)" onclick="sendCtrl('wb=0')"><span>AWB</span><span class="state-pill" id="pillWb0">ON</span></button>
+          <button id="wb1" title="Daylight White Balance (5500K)" onclick="sendCtrl('wb=1')"><span>Day</span><span class="state-pill" id="pillWb1">OFF</span></button>
+          <button id="wb2" title="Cloudy Daylight White Balance (6500K)" onclick="sendCtrl('wb=2')"><span>Cloud</span><span class="state-pill" id="pillWb2">OFF</span></button>
+          <button id="wb3" title="Tungsten / Incandescent White Balance (2800K)" onclick="sendCtrl('wb=3')"><span>Tung</span><span class="state-pill" id="pillWb3">OFF</span></button>
+          <button id="wb4" title="Fluorescent White Balance (4000K)" onclick="sendCtrl('wb=4')"><span>Fluo</span><span class="state-pill" id="pillWb4">OFF</span></button>
         </div>
       </div>
 
       <div class="section">
         <div class="section-title">Metal Studio ISP</div>
-        <div class="slider-row">
+        <div class="slider-row" title="Metal Studio ISP Exposure / Brightness Gain (70% – 160%)">
           <span class="slider-label">Exposure</span>
           <input type="range" id="slBrightness" min="0.70" max="1.60" step="0.01" value="1.12" oninput="onSlider('brightness', this.value)" />
           <span class="slider-val" id="valBrightness">112%</span>
         </div>
-        <div class="slider-row">
+        <div class="slider-row" title="Metal Studio ISP Shadow Lift (-25% to +65%)">
           <span class="slider-label">Shadows</span>
           <input type="range" id="slShadowLift" min="-0.25" max="0.65" step="0.01" value="0.16" oninput="onSlider('shadowLift', this.value)" />
           <span class="slider-val" id="valShadowLift">16%</span>
         </div>
-        <div class="slider-row">
+        <div class="slider-row" title="Metal Studio ISP S-Curve Contrast (75% – 145%)">
           <span class="slider-label">Contrast</span>
           <input type="range" id="slContrast" min="0.75" max="1.45" step="0.01" value="1.05" oninput="onSlider('contrast', this.value)" />
           <span class="slider-val" id="valContrast">105%</span>
         </div>
-        <div class="slider-row">
+        <div class="slider-row" title="Metal GPU Bilateral + Temporal 3DNR Denoise (0% – 100%)">
           <span class="slider-label">Denoise</span>
           <input type="range" id="slDenoise" min="0.0" max="1.0" step="0.01" value="0.38" oninput="onSlider('denoise', this.value)" />
           <span class="slider-val" id="valDenoise">38%</span>
         </div>
-        <div class="slider-row">
+        <div class="slider-row" title="Metal GPU Luma-Adaptive Unsharp Mask Sharpness (0% – 120%)">
           <span class="slider-label">Sharpness</span>
           <input type="range" id="slSharpness" min="0.0" max="1.2" step="0.01" value="0.52" oninput="onSlider('sharpness', this.value)" />
           <span class="slider-val" id="valSharpness">52%</span>
         </div>
-        <div class="slider-row">
+        <div class="slider-row" title="Metal Studio ISP Color Saturation (50% – 150%)">
           <span class="slider-label">Saturation</span>
           <input type="range" id="slSaturation" min="0.5" max="1.5" step="0.01" value="1.04" oninput="onSlider('saturation', this.value)" />
           <span class="slider-val" id="valSaturation">104%</span>
         </div>
-        <div class="slider-row">
+        <div class="slider-row" title="Metal Studio ISP Color Temperature Warmth (-0.5 Cool to +0.5 Warm)">
           <span class="slider-label">Warmth</span>
           <input type="range" id="slWarmth" min="-0.5" max="0.5" step="0.01" value="0.0" oninput="onSlider('warmth', this.value)" />
           <span class="slider-val" id="valWarmth">+0</span>
@@ -3661,8 +4313,12 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         let dragging = false;
         document.querySelectorAll('input[type=range]').forEach(el => {
           el.addEventListener('mousedown', () => dragging = true);
+          el.addEventListener('touchstart', () => dragging = true, {passive: true});
           el.addEventListener('mouseup', () => dragging = false);
+          el.addEventListener('touchend', () => dragging = false);
         });
+        window.addEventListener('mouseup', () => dragging = false);
+        window.addEventListener('touchend', () => dragging = false);
 
         async function sendCtrl(q) {
           try {
@@ -3676,11 +4332,16 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
           sendCtrl(k + '=' + encodeURIComponent(v));
         }
 
-        function setActive(id, cond) {
-          const el = document.getElementById(id);
-          if (!el) return;
-          if (cond) el.classList.add('active');
-          else el.classList.remove('active');
+        function setButtonState(btnId, pillId, isOn, customOnText, customOffText) {
+          const el = document.getElementById(btnId);
+          const pill = document.getElementById(pillId);
+          if (el) {
+            if (isOn) el.classList.add('active');
+            else el.classList.remove('active');
+          }
+          if (pill) {
+            pill.textContent = isOn ? (customOnText || 'ON') : (customOffText || 'OFF');
+          }
         }
 
         function renderState(st) {
@@ -3688,21 +4349,29 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
           document.getElementById('resText').textContent = (st.frameW || 1920) + 'x' + (st.frameH || 1080) + ' • METAL ISP';
           document.getElementById('connDot').style.background = st.connected ? '#19E673' : '#FF453A';
 
-          setActive('lens0', st.camera === 0);
-          setActive('lens1', st.camera === 1);
-          setActive('btnFlash', !!st.flash);
-          setActive('btnWand', !!st.wand);
-          setActive('btnMirrorH', !!st.mirrorH);
-          setActive('btnMirrorV', !!st.mirrorV);
-
-          for (let i = 0; i < 7; i++) setActive('preset' + i, st.preset === i);
-          for (let i = 0; i < 5; i++) setActive('wb' + i, st.wb === i);
-
           const fl = (st.flash && st.flashLevel > 0) ? st.flashLevel : 0;
+          setButtonState('btnWand', 'pillWand', !!st.wand, 'ON', 'OFF');
+          setButtonState('btnReset', 'pillReset', !!st.isDefault, 'ON', 'OFF');
+          setButtonState('lens0', 'pillLens0', st.camera === 0, 'ON', 'OFF');
+          setButtonState('lens1', 'pillLens1', st.camera === 1, 'ON', 'OFF');
+          setButtonState('btnFlash', 'pillFlash', !!st.flash, fl > 0 ? ('ON ' + fl + '%') : 'ON', 'OFF');
+
+          const rotDeg = ((st.rotation || 0) % 4) * 90;
+          setButtonState('btnRotate', 'pillRotate', rotDeg !== 0, 'ON ' + rotDeg + '°', 'OFF 0°');
+          setButtonState('btnMirrorH', 'pillMirrorH', !!st.mirrorH, 'ON', 'OFF');
+          setButtonState('btnMirrorV', 'pillMirrorV', !!st.mirrorV, 'ON', 'OFF');
+
+          for (let i = 0; i < 7; i++) {
+            setButtonState('preset' + i, 'pillPreset' + i, st.preset === i, 'ON', 'OFF');
+          }
+          for (let i = 0; i < 5; i++) {
+            setButtonState('wb' + i, 'pillWb' + i, st.wb === i, 'ON', 'OFF');
+          }
+
           if (!dragging) {
             document.getElementById('slFlashLevel').value = fl;
+            document.getElementById('slQuickZoom').value = st.zoom;
             document.getElementById('slEv').value = st.ev;
-            document.getElementById('slZoom').value = st.zoom;
             document.getElementById('slBrightness').value = st.brightness;
             document.getElementById('slShadowLift').value = st.shadowLift;
             document.getElementById('slContrast').value = st.contrast;
@@ -3712,8 +4381,8 @@ final class PxlCamAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
             document.getElementById('slWarmth').value = st.warmth;
           }
           document.getElementById('valFlashLevel').textContent = fl > 0 ? fl + '%' : 'OFF';
+          document.getElementById('valQuickZoom').textContent = Number(st.zoom).toFixed(1) + '×';
           document.getElementById('valEv').textContent = st.ev > 0 ? '+' + st.ev : '' + st.ev;
-          document.getElementById('valZoom').textContent = Number(st.zoom).toFixed(1) + 'x';
           document.getElementById('valBrightness').textContent = Math.round(st.brightness * 100) + '%';
           document.getElementById('valShadowLift').textContent = Math.round(st.shadowLift * 100) + '%';
           document.getElementById('valContrast').textContent = Math.round(st.contrast * 100) + '%';

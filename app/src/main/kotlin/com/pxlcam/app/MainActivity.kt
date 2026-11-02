@@ -46,6 +46,7 @@ class MainActivity : AppCompatActivity(), PxlCamEngine.Listener {
     private var serviceBound = false
 
     private lateinit var surfaceView: SurfaceView
+    private lateinit var torchDimmerScrim: View
     private lateinit var topLeftOverlayBrand: ImageView
     private lateinit var statusBadge: TextView
     private lateinit var telemetryText: TextView
@@ -54,10 +55,10 @@ class MainActivity : AppCompatActivity(), PxlCamEngine.Listener {
     private lateinit var btnFlash: Button
     private lateinit var flashSeekBar: SeekBar
     private lateinit var flashValueText: TextView
+    private lateinit var topZoomSeekBar: SeekBar
+    private lateinit var topZoomValueText: TextView
     private lateinit var evSeekBar: SeekBar
     private lateinit var evValueText: TextView
-    private lateinit var zoomSeekBar: SeekBar
-    private lateinit var zoomValueText: TextView
     private val wbButtons = mutableListOf<Button>()
     private val afButtons = mutableListOf<Button>()
     private lateinit var oledOverlay: FrameLayout
@@ -258,6 +259,17 @@ class MainActivity : AppCompatActivity(), PxlCamEngine.Listener {
             FrameLayout.LayoutParams.MATCH_PARENT
         ))
 
+        torchDimmerScrim = View(this).apply {
+            setBackgroundColor(Color.BLACK)
+            alpha = 0f
+            isClickable = false
+            isFocusable = false
+        }
+        previewFrame.addView(torchDimmerScrim, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.MATCH_PARENT
+        ))
+
         // Top-Left Coral Fox + 80's Glam BTTF PXL/CAM Camera Wordmark Overlay
         topLeftOverlayBrand = ImageView(this).apply {
             setImageResource(R.drawable.pxl_cam_top_left_overlay)
@@ -343,9 +355,36 @@ class MainActivity : AppCompatActivity(), PxlCamEngine.Listener {
         flashDimRow.addView(flashSeekBar)
         flashDimRow.addView(flashValueText)
         lensCard.addView(flashDimRow)
+
+        val topZoomRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8), 0, 0)
+        }
+        topZoomRow.addView(makeLabel("🔍 Zoom", 68))
+        topZoomSeekBar = SeekBar(this).apply {
+            max = 30
+            progress = 0
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                    val z = 1.0f + (p / 10.0f)
+                    topZoomValueText.text = String.format("%.1f×", z)
+                    if (fromUser) {
+                        streamingService?.engine?.setZoom(z)
+                    }
+                }
+                override fun onStartTrackingTouch(sb: SeekBar?) {}
+                override fun onStopTrackingTouch(sb: SeekBar?) {}
+            })
+        }
+        topZoomValueText = makeValueLabel("1.0×")
+        topZoomRow.addView(topZoomSeekBar)
+        topZoomRow.addView(topZoomValueText)
+        lensCard.addView(topZoomRow)
         container.addView(lensCard)
 
-        // 4. Exposure & Zoom Sliders Card
+        // 4. Exposure Slider Card
         val sensorCard = makeSectionCard("HARDWARE EXPOSURE & OPTICS")
         val evRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -370,31 +409,6 @@ class MainActivity : AppCompatActivity(), PxlCamEngine.Listener {
         evRow.addView(evSeekBar)
         evRow.addView(evValueText)
         sensorCard.addView(evRow)
-
-        val zoomRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(8), 0, 0)
-        }
-        zoomRow.addView(makeLabel("HW Zoom", 68))
-        zoomSeekBar = SeekBar(this).apply {
-            max = 30
-            progress = 0
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                    val z = 1.0f + (p / 10.0f)
-                    zoomValueText.text = String.format("%.1fx", z)
-                    if (fromUser) streamingService?.engine?.setZoom(z)
-                }
-                override fun onStartTrackingTouch(sb: SeekBar?) {}
-                override fun onStopTrackingTouch(sb: SeekBar?) {}
-            })
-        }
-        zoomValueText = makeValueLabel("1.0x")
-        zoomRow.addView(zoomSeekBar)
-        zoomRow.addView(zoomValueText)
-        sensorCard.addView(zoomRow)
         container.addView(sensorCard)
 
         // 5. White Balance & Focus Card
@@ -502,13 +516,18 @@ class MainActivity : AppCompatActivity(), PxlCamEngine.Listener {
             val effectivePct = if (flashOn) torchStrengthPercent.coerceIn(1, 100) else 0
             flashSeekBar.progress = effectivePct
             flashValueText.text = if (effectivePct == 0) "OFF" else "$effectivePct%"
+            torchDimmerScrim.alpha = if (effectivePct in 1..99) {
+                ((100 - effectivePct) / 100.0f) * 0.80f
+            } else {
+                0.0f
+            }
 
             evSeekBar.progress = (evOffset + 8).coerceIn(0, 16)
             evValueText.text = if (evOffset > 0) "+$evOffset" else "$evOffset"
 
             val zProg = ((zoomRatio - 1.0f) * 10.0f).toInt().coerceIn(0, 30)
-            zoomSeekBar.progress = zProg
-            zoomValueText.text = String.format("%.1fx", zoomRatio)
+            topZoomSeekBar.progress = zProg
+            topZoomValueText.text = String.format("%.1f×", zoomRatio)
 
             for (i in wbButtons.indices) stylePillButton(wbButtons[i], i == wbMode)
             for (i in afButtons.indices) stylePillButton(afButtons[i], i == afMode)

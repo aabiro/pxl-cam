@@ -130,7 +130,16 @@ class PxlCamEngine(private val context: Context) {
     fun start(width: Int = 1920, height: Int = 1080) {
         streamWidth = width
         streamHeight = height
-        if (running.getAndSet(true)) return
+        if (running.getAndSet(true)) {
+            if (serverSocket == null || serverSocket?.isClosed == true) {
+                startTcpServerThread()
+            }
+            if (cameraDevice == null) {
+                cameraHandler?.post { reopenCameraAndEncoder() }
+            }
+            notifyListener()
+            return
+        }
 
         cameraThread = HandlerThread("PxlCamCameraThread").apply { start() }
         cameraHandler = Handler(cameraThread!!.looper)
@@ -201,7 +210,7 @@ class PxlCamEngine(private val context: Context) {
     }
 
     fun setZoom(zoom: Float) {
-        zoomRatio = zoom.coerceIn(1.0f, 4.0f)
+        zoomRatio = zoom.coerceIn(1.0f, 6.0f)
         cameraHandler?.post { updateRepeatingRequest() }
         notifyListener()
     }
@@ -220,31 +229,36 @@ class PxlCamEngine(private val context: Context) {
 
     private fun startTcpServerThread() {
         Thread({
-            try {
-                val srv = ServerSocket()
-                srv.reuseAddress = true
-                srv.bind(InetSocketAddress(STREAM_PORT))
-                serverSocket = srv
-                Log.i(TAG, "PXLC TCP Server listening on :$STREAM_PORT")
+            while (running.get()) {
+                var srv: ServerSocket? = null
+                try {
+                    srv = ServerSocket()
+                    srv.reuseAddress = true
+                    srv.bind(InetSocketAddress(STREAM_PORT))
+                    serverSocket = srv
+                    Log.i(TAG, "PXLC TCP Server listening on :$STREAM_PORT")
 
-                while (running.get()) {
-                    val sock = srv.accept()
-                    sock.tcpNoDelay = true
-                    sock.sendBufferSize = 512 * 1024
-                    val out = DataOutputStream(BufferedOutputStream(sock.getOutputStream(), 64 * 1024))
-                    val session = ClientSession(sock, out)
-                    clients.add(session)
-                    notifyListener()
+                    while (running.get() && !srv.isClosed) {
+                        val sock = srv.accept()
+                        sock.tcpNoDelay = true
+                        sock.sendBufferSize = 512 * 1024
+                        val out = DataOutputStream(BufferedOutputStream(sock.getOutputStream(), 64 * 1024))
+                        val session = ClientSession(sock, out)
+                        clients.add(session)
+                        notifyListener()
 
-                    cameraHandler?.post { requestImmediateKeyframe() }
+                        cameraHandler?.post { requestImmediateKeyframe() }
 
-                    Thread({
-                        handleClientControlLoop(session)
-                    }, "PxlCamClientCtrl").start()
-                }
-            } catch (e: Throwable) {
-                if (running.get()) {
-                    Log.e(TAG, "TCP Server error", e)
+                        Thread({
+                            handleClientControlLoop(session)
+                        }, "PxlCamClientCtrl").start()
+                    }
+                } catch (e: Throwable) {
+                    if (running.get()) {
+                        Log.w(TAG, "TCP Server bind/accept retry on :$STREAM_PORT", e)
+                        try { srv?.close() } catch (_: Throwable) {}
+                        try { Thread.sleep(400) } catch (_: Throwable) {}
+                    }
                 }
             }
         }, "PxlCamTcpAccept").start()
@@ -417,8 +431,8 @@ class PxlCamEngine(private val context: Context) {
             } else {
                 1
             }
-            val sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
-            sensorRotationQuadrants = ((sensorOrientation / 90) % 4 + 4) % 4
+            // Default 1920x1080 stream to 0 quadrants (16:9 landscape)
+            sensorRotationQuadrants = 0
 
             setupMediaCodec()
 
@@ -429,14 +443,24 @@ class PxlCamEngine(private val context: Context) {
                 }
 
                 override fun onDisconnected(camera: CameraDevice) {
-                    camera.close()
+                    try { camera.close() } catch (_: Throwable) {}
                     cameraDevice = null
+                    if (running.get()) {
+                        cameraHandler?.postDelayed({
+                            if (running.get() && cameraDevice == null) reopenCameraAndEncoder()
+                        }, 600L)
+                    }
                 }
 
                 override fun onError(camera: CameraDevice, error: Int) {
                     Log.e(TAG, "CameraDevice error: $error")
-                    camera.close()
+                    try { camera.close() } catch (_: Throwable) {}
                     cameraDevice = null
+                    if (running.get()) {
+                        cameraHandler?.postDelayed({
+                            if (running.get() && cameraDevice == null) reopenCameraAndEncoder()
+                        }, 800L)
+                    }
                 }
             }, cameraHandler)
         } catch (e: Throwable) {
@@ -533,16 +557,27 @@ class PxlCamEngine(private val context: Context) {
         val targets = mutableListOf(encSurface)
         previewSurface?.takeIf { it.isValid }?.let { targets.add(it) }
 
-        camera.createCaptureSession(targets, object : CameraCaptureSession.StateCallback() {
-            override fun onConfigured(session: CameraCaptureSession) {
-                captureSession = session
-                updateRepeatingRequest()
-            }
+        try {
+            camera.createCaptureSession(targets, object : CameraCaptureSession.StateCallback() {
+                override fun onConfigured(session: CameraCaptureSession) {
+                    captureSession = session
+                    updateRepeatingRequest()
+                }
 
-            override fun onConfigureFailed(session: CameraCaptureSession) {
-                Log.e(TAG, "CameraCaptureSession configure failed")
+                override fun onConfigureFailed(session: CameraCaptureSession) {
+                    Log.e(TAG, "CameraCaptureSession configure failed")
+                }
+            }, cameraHandler)
+        } catch (e: Throwable) {
+            Log.e(TAG, "createCaptureSession failed, scheduling reopen", e)
+            try { camera.close() } catch (_: Throwable) {}
+            cameraDevice = null
+            if (running.get()) {
+                cameraHandler?.postDelayed({
+                    if (running.get() && cameraDevice == null) reopenCameraAndEncoder()
+                }, 600L)
             }
-        }, cameraHandler)
+        }
     }
 
     private fun updateRepeatingRequest() {
@@ -595,25 +630,26 @@ class PxlCamEngine(private val context: Context) {
                 if (evRange != null) {
                     var effectiveEv = exposureOffset
                     if (isFlashOn && currentCameraIndex == 0 && torchStrengthPercent in 1..99 && maxHwTorchStrengthLevel <= 1) {
-                        val flashDimSteps = kotlin.math.round(((torchStrengthPercent - 100) / 100.0f) * 8.0f).toInt()
+                        val flashDimSteps = kotlin.math.round(((torchStrengthPercent - 100) / 100.0f) * 12.0f).toInt()
                         effectiveEv += flashDimSteps
                     }
                     val clampedEv = effectiveEv.coerceIn(evRange.lower, evRange.upper)
                     req.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, clampedEv)
                 }
 
-                // Hardware Zoom via SCALER_CROP_REGION / CONTROL_ZOOM_RATIO
+                // Hardware Zoom via both CONTROL_ZOOM_RATIO (Android 11+) and SCALER_CROP_REGION
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    req.set(CaptureRequest.CONTROL_ZOOM_RATIO, zoomRatio)
-                } else {
-                    val activeArray = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
-                    if (activeArray != null && zoomRatio > 1.0f) {
-                        val cropW = (activeArray.width() / zoomRatio).toInt()
-                        val cropH = (activeArray.height() / zoomRatio).toInt()
-                        val left = (activeArray.width() - cropW) / 2
-                        val top = (activeArray.height() - cropH) / 2
-                        req.set(CaptureRequest.SCALER_CROP_REGION, Rect(left, top, left + cropW, top + cropH))
-                    }
+                    try {
+                        req.set(CaptureRequest.CONTROL_ZOOM_RATIO, zoomRatio)
+                    } catch (_: Throwable) {}
+                }
+                val activeArray = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+                if (activeArray != null) {
+                    val cropW = (activeArray.width() / zoomRatio).toInt().coerceIn(64, activeArray.width())
+                    val cropH = (activeArray.height() / zoomRatio).toInt().coerceIn(64, activeArray.height())
+                    val left = (activeArray.width() - cropW) / 2
+                    val top = (activeArray.height() - cropH) / 2
+                    req.set(CaptureRequest.SCALER_CROP_REGION, Rect(left, top, left + cropW, top + cropH))
                 }
             }
 
